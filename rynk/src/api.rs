@@ -396,6 +396,19 @@ impl Client {
         self.require_ble(Cmd::ClearBleProfile)?;
         self.request::<command::ClearBleProfile>(&slot).await
     }
+
+    /// Read the persisted background-connection setting.
+    pub async fn get_ble_background_connections(&self) -> Result<bool, RynkHostError> {
+        self.require_ble(Cmd::GetBleBackgroundConnections)?;
+        self.request::<command::GetBleBackgroundConnections>(&()).await
+    }
+
+    /// Queue a background-connection change. Enabling requires multiple host links.
+    /// Disabling background connections can disconnect the requesting host before it receives the reply.
+    pub async fn set_ble_background_connections(&self, enabled: bool) -> Result<(), RynkHostError> {
+        self.require_ble(Cmd::SetBleBackgroundConnections)?;
+        self.request::<command::SetBleBackgroundConnections>(&enabled).await
+    }
 }
 
 #[cfg(feature = "alloc")]

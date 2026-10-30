@@ -47,6 +47,10 @@ impl<'a> RynkService<'a> {
 
     /// Whether `cmd` needs a storage write to persist its effect.
     fn needs_storage_write(cmd: Cmd) -> bool {
+        #[cfg(feature = "_ble")]
+        if cmd == Cmd::SetBleBackgroundConnections {
+            return true;
+        }
         matches!(
             cmd,
             Cmd::SetKeyAction
@@ -129,6 +133,10 @@ impl<'a> RynkService<'a> {
             Cmd::SwitchBleProfile => serve::<command::SwitchBleProfile, _>(self, msg).await,
             #[cfg(feature = "_ble")]
             Cmd::ClearBleProfile => serve::<command::ClearBleProfile, _>(self, msg).await,
+            #[cfg(feature = "_ble")]
+            Cmd::GetBleBackgroundConnections => serve::<command::GetBleBackgroundConnections, _>(self, msg).await,
+            #[cfg(feature = "_ble")]
+            Cmd::SetBleBackgroundConnections => serve::<command::SetBleBackgroundConnections, _>(self, msg).await,
 
             Cmd::GetCurrentLayer => serve::<command::GetCurrentLayer, _>(self, msg).await,
             Cmd::GetMatrixState => serve::<command::GetMatrixState, _>(self, msg).await,
@@ -392,8 +400,15 @@ mod tests {
         };
         let service = RynkService::new(&keymap, &config);
 
-        for cmd in [Cmd::SwitchBleProfile, Cmd::ClearBleProfile] {
-            let request = req_with(cmd.raw(), 1, &0u8);
+        for cmd in [
+            Cmd::SwitchBleProfile,
+            Cmd::ClearBleProfile,
+            Cmd::SetBleBackgroundConnections,
+        ] {
+            let request = match cmd {
+                Cmd::SetBleBackgroundConnections => req_with(cmd.raw(), 1, &false),
+                _ => req_with(cmd.raw(), 1, &0u8),
+            };
             block_on(service.run(&mut request.as_slice(), &mut [].as_mut_slice()));
 
             let mut tx = VecWrite { captured: Vec::new() };
@@ -403,6 +418,10 @@ mod tests {
                 (cmd, BLE_PROFILE_CHANNEL.try_receive()),
                 (Cmd::SwitchBleProfile, Ok(BleProfileAction::Switch(0)))
                     | (Cmd::ClearBleProfile, Ok(BleProfileAction::ClearSlot(0)))
+                    | (
+                        Cmd::SetBleBackgroundConnections,
+                        Ok(BleProfileAction::SetBackgroundConnections(false))
+                    )
             ));
         }
     }

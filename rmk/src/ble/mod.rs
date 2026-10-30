@@ -443,6 +443,11 @@ async fn run_ble_keyboard<
     }));
 
     let connection_loop = async {
+        let mut background_connections = NUM_HOST_LINKS > 1
+            && !matches!(
+                crate::storage::read(crate::storage::StorageKey::BleBackgroundConnections).await,
+                Ok(Some(crate::storage::StorageValue::BleBackgroundConnections(false)))
+            );
         // Keep each host or dongle handle indexed by profile until its GATT worker finishes.
         let mut host_connections: [Option<Connection<'_, DefaultPacketPool>>; BOND_SLOTS] =
             core::array::from_fn(|_| None);
@@ -456,8 +461,9 @@ async fn run_ble_keyboard<
                 .then(|| BdAddr::new(crate::ble::profile::profile_address(address, profile_id)));
 
             let connect = async {
+                let capacity = if background_connections { NUM_HOST_LINKS } else { 1 };
                 if host_connections[profile_id as usize].is_some()
-                    || host_connections.iter().flatten().count() >= NUM_HOST_LINKS
+                    || host_connections.iter().flatten().count() >= capacity
                 {
                     return core::future::pending().await;
                 }
@@ -548,43 +554,59 @@ async fn run_ble_keyboard<
                     error!("Advertise error: {:?}", e);
                     Timer::after_millis(200).await;
                 }
-                Either4::Second(Some(change)) => {
-                    report_activity();
-                    advertising_paused = false;
-                    match change {
-                        ProfileChange::ClearBond(slot) => {
-                            disconnect_profile(slot, &mut host_connections, &completed).await;
-                            profile_manager.clear_bond(slot);
-                        }
-                        ProfileChange::SwitchTo(slot) | ProfileChange::Pair(slot) => {
-                            if slot != profile_id {
-                                if let Some(pairing) = profile_manager.repairing.get() {
-                                    disconnect_profile(pairing, &mut host_connections, &completed).await;
-                                    profile_manager.set_pairing(None);
-                                }
-                                if NUM_HOST_LINKS == 1
-                                    && let Some(conn) = &host_connections[profile_id as usize]
+                Either4::Second(Some(change)) => match change {
+                    ProfileChange::SetBackgroundConnections(enabled) => {
+                        background_connections = enabled;
+                        if !enabled {
+                            for (slot, conn) in host_connections.iter().enumerate() {
+                                if slot != usize::from(profile_id)
+                                    && let Some(conn) = conn
                                 {
                                     conn.disconnect();
                                 }
-                                let state = if host_connections[slot as usize]
-                                    .as_ref()
-                                    .is_some_and(|conn| conn.security_level().is_ok_and(|level| level.encrypted()))
-                                {
-                                    BleState::Connected
-                                } else {
-                                    BleState::Inactive
-                                };
-                                profile_manager.switch_profile(slot, state);
-                            }
-                            if matches!(change, ProfileChange::Pair(_)) {
-                                disconnect_profile(slot, &mut host_connections, &completed).await;
-                                profile_manager.set_pairing(Some(slot));
-                                pairing_deadline = Instant::now() + Duration::from_secs(300);
                             }
                         }
+                        if crate::storage::store(crate::storage::StorageItem::BleBackgroundConnections(enabled))
+                            .await
+                            .is_err()
+                        {
+                            error!("Failed to save background connection setting");
+                        }
                     }
-                }
+                    ProfileChange::ClearBond(slot) => {
+                        report_activity();
+                        advertising_paused = false;
+                        disconnect_profile(slot, &mut host_connections, &completed).await;
+                        profile_manager.clear_bond(slot);
+                    }
+                    ProfileChange::SwitchTo(slot) | ProfileChange::Pair(slot) => {
+                        report_activity();
+                        advertising_paused = false;
+                        if slot != profile_id {
+                            if let Some(pairing) = profile_manager.repairing.get() {
+                                disconnect_profile(pairing, &mut host_connections, &completed).await;
+                                profile_manager.set_pairing(None);
+                            }
+                            if !background_connections && let Some(conn) = &host_connections[profile_id as usize] {
+                                conn.disconnect();
+                            }
+                            let state = if host_connections[slot as usize]
+                                .as_ref()
+                                .is_some_and(|conn| conn.security_level().is_ok_and(|level| level.encrypted()))
+                            {
+                                BleState::Connected
+                            } else {
+                                BleState::Inactive
+                            };
+                            profile_manager.switch_profile(slot, state);
+                        }
+                        if matches!(change, ProfileChange::Pair(_)) {
+                            disconnect_profile(slot, &mut host_connections, &completed).await;
+                            profile_manager.set_pairing(Some(slot));
+                            pairing_deadline = Instant::now() + Duration::from_secs(300);
+                        }
+                    }
+                },
                 Either4::Second(None) => {}
                 Either4::Third(ended) => {
                     host_connections[ended as usize].take();

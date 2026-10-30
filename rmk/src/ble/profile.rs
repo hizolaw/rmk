@@ -92,6 +92,7 @@ impl Default for ProfileInfo {
 pub(crate) enum BleProfileAction {
     Switch(u8),
     Pair(u8),
+    SetBackgroundConnections(bool),
     Previous,
     Next,
     ClearBond,
@@ -101,11 +102,12 @@ pub(crate) enum BleProfileAction {
     ClearSlot(u8),
 }
 
-/// A requested change with its target profile resolved.
+/// A change for the connection loop, with any target profile already resolved.
 pub(super) enum ProfileChange {
     SwitchTo(u8),
     Pair(u8),
     ClearBond(u8),
+    SetBackgroundConnections(bool),
 }
 
 /// Manage BLE profiles and bonding information
@@ -191,6 +193,9 @@ where
             BleProfileAction::Switch(slot) | BleProfileAction::Pair(slot) => slot,
             BleProfileAction::ClearBond => return Some(ProfileChange::ClearBond(current)),
             BleProfileAction::ClearSlot(slot) => return Some(ProfileChange::ClearBond(slot)),
+            BleProfileAction::SetBackgroundConnections(enabled) => {
+                return Some(ProfileChange::SetBackgroundConnections(enabled));
+            }
             BleProfileAction::Previous | BleProfileAction::Next if NUM_BLE_PROFILE == 0 => return None,
             BleProfileAction::Previous if current == 0 => NUM_BLE_PROFILE.saturating_sub(1) as u8,
             BleProfileAction::Previous => current - 1,

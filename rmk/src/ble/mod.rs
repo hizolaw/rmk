@@ -461,7 +461,7 @@ async fn run_ble_keyboard<
             let local_address = cfg!(feature = "ext_adv")
                 .then(|| BdAddr::new(crate::ble::profile::profile_address(address, profile_id)));
 
-            let advertise_and_accept = async {
+            let advertise_and_connect = async {
                 if host_connections[profile_id as usize].is_some()
                     || (!background_connections && host_connections.iter().any(Option::is_some))
                 {
@@ -496,8 +496,12 @@ async fn run_ble_keyboard<
             };
 
             // Consume queued wake input before a profile action can cancel the connection flow.
-            let gatt_conn = match select3(advertise_and_accept, BLE_PROFILE_CHANNEL.receive(), completed.receive())
-                .await
+            let gatt_conn = match select3(
+                advertise_and_connect,
+                BLE_PROFILE_CHANNEL.receive(),
+                completed.receive(),
+            )
+            .await
             {
                 Either3::First(Ok(gatt_conn)) => gatt_conn,
                 Either3::First(Err(BleHostError::BleHost(Error::Timeout))) => {
@@ -560,10 +564,9 @@ async fn run_ble_keyboard<
                     }
 
                     if slot != profile_id {
-                        if let Some(pairing) = profile_manager.repairing.get() {
-                            disconnect_profile(pairing, &mut host_connections, &completed).await;
-                        } else if !background_connections && let Some(conn) = &host_connections[profile_id as usize] {
-                            conn.disconnect();
+                        let active = crate::state::current_ble_status();
+                        if !background_connections || !active.bonded || active.state != BleState::Connected {
+                            disconnect_profile(profile_id, &mut host_connections, &completed).await;
                         }
                         let state = match &host_connections[slot as usize] {
                             Some(conn) if conn.security_level().is_ok_and(|level| level.encrypted()) => {
@@ -572,6 +575,13 @@ async fn run_ble_keyboard<
                             _ => BleState::Inactive,
                         };
                         profile_manager.switch_profile(slot, state);
+                        for (i, conn) in host_connections.iter().enumerate() {
+                            if let Some(conn) = conn
+                                && let Err(e) = conn.set_bondable(i == slot as usize)
+                            {
+                                error!("Set bondable error: {:?}", e);
+                            }
+                        }
                     }
                     if pair {
                         disconnect_profile(slot, &mut host_connections, &completed).await;
@@ -710,6 +720,13 @@ async fn gatt_events_task<C: Controller + ControllerCmdAsync<LeSetPhy>>(
                 passkey_state.clear();
                 info!("[gatt] disconnected: {:?}", reason);
                 break;
+            }
+            GattConnectionEvent::PairingComplete { bond: Some(_), .. }
+            | GattConnectionEvent::PassKeyInput
+            | GattConnectionEvent::BondLost
+                if profile_id != crate::state::current_profile() =>
+            {
+                conn.raw().disconnect();
             }
             GattConnectionEvent::PairingComplete { security_level, bond } => {
                 #[cfg(feature = "passkey_entry")]
@@ -983,12 +1000,7 @@ async fn gatt_events_task<C: Controller + ControllerCmdAsync<LeSetPhy>>(
                 #[cfg(not(feature = "passkey_entry"))]
                 warn!("[gatt] PassKeyInput event, should not happen")
             }
-            GattConnectionEvent::BondLost => {
-                warn!("[gatt] BondLost");
-                if profile_id != crate::state::current_profile() {
-                    conn.raw().disconnect();
-                }
-            }
+            GattConnectionEvent::BondLost => warn!("[gatt] BondLost"),
             GattConnectionEvent::OobRequest => warn!("[gatt] OobRequest"),
         }
     }

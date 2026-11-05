@@ -2,6 +2,8 @@
 
 #[cfg(feature = "lcd_async")]
 pub mod lcd_async;
+#[cfg(feature = "ls0xx")]
+pub mod ls0xx;
 #[cfg(feature = "oled_async")]
 mod oled_async;
 #[cfg(feature = "ssd1306")]

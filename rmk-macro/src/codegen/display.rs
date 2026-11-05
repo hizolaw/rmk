@@ -1,7 +1,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use rmk_config::resolved::hardware::{
-    ChipSeries, CommunicationProtocol, DisplayConfig, DisplayDriver, I2cConfig,
+    ChipSeries, CommunicationProtocol, DisplayConfig, DisplayDriver, I2cConfig, SpiConfig,
 };
 
 use super::input_device::Initializer;
@@ -36,7 +36,18 @@ pub(crate) fn expand_display_interrupt(
 ) -> TokenStream {
     match &display_config.protocol {
         CommunicationProtocol::I2c(i2c) => expand_i2c_interrupt(chip_series, i2c),
-        CommunicationProtocol::Spi(_) => panic!("SPI display interface is not yet supported"),
+        CommunicationProtocol::Spi(spi) => expand_spi_interrupt(chip_series, spi),
+    }
+}
+
+/// Bind the SPI instance's interrupt, required by the async `Spim` driver.
+fn expand_spi_interrupt(chip_series: &ChipSeries, spi: &SpiConfig) -> TokenStream {
+    let instance = format_ident!("{}", spi.instance);
+    match chip_series {
+        ChipSeries::Nrf52 => quote! {
+            #instance => ::embassy_nrf::spim::InterruptHandler<::embassy_nrf::peripherals::#instance>;
+        },
+        _ => panic!("SPI display is only implemented for nRF52"),
     }
 }
 
@@ -72,7 +83,40 @@ fn expand_i2c_interrupt(chip_series: &ChipSeries, i2c: &I2cConfig) -> TokenStrea
 fn expand_protocol_init(chip_series: &ChipSeries, protocol: &CommunicationProtocol) -> TokenStream {
     match protocol {
         CommunicationProtocol::I2c(i2c) => expand_i2c_init(chip_series, i2c),
-        CommunicationProtocol::Spi(_) => panic!("SPI display interface is not yet supported"),
+        CommunicationProtocol::Spi(spi) => expand_spi_init(chip_series, spi),
+    }
+}
+
+/// Create an async SPI bus for an SPI display (nRF52 only for now).
+///
+/// Note: nRF52840's SPIM0 shares the `TWISPI0` peripheral, so `instance` in
+/// `keyboard.toml` must be `"TWISPI0"` for that bus.
+fn expand_spi_init(chip_series: &ChipSeries, spi: &SpiConfig) -> TokenStream {
+    let instance = format_ident!("{}", spi.instance.to_uppercase());
+    let sck = format_ident!("{}", spi.sck);
+    let mosi = format_ident!("{}", spi.mosi);
+    let miso = format_ident!("{}", spi.miso);
+
+    let cs = spi
+        .cs
+        .as_ref()
+        .unwrap_or_else(|| panic!("SPI display requires `cs` in [display.protocol.spi]"));
+
+    match chip_series {
+        ChipSeries::Nrf52 => {
+            let cs = format_ident!("{}", cs);
+            quote! {
+                let display_spi = {
+                    use ::embassy_nrf::spim::{Frequency, Spim, Config, MODE_0};
+                    let mut cfg = Config::default();
+                    cfg.frequency = Frequency::M1;
+                    cfg.mode = MODE_0;
+                    Spim::new(p.#instance, Irqs, p.#sck, p.#miso, p.#mosi, cfg)
+                };
+                let display_cs_pin = p.#cs;
+            }
+        }
+        _ => panic!("SPI display is only implemented for nRF52"),
     }
 }
 
@@ -121,11 +165,35 @@ fn expand_i2c_init(chip_series: &ChipSeries, i2c: &I2cConfig) -> TokenStream {
 fn get_i2c_address(config: &DisplayConfig) -> u8 {
     match &config.protocol {
         CommunicationProtocol::I2c(i2c) => i2c.address,
-        CommunicationProtocol::Spi(_) => panic!("SPI display interface is not yet supported"),
+        CommunicationProtocol::Spi(_) => {
+            panic!("display driver '{}' uses I2C but [display.protocol.spi] was given", display_driver_name(config))
+        }
+    }
+}
+
+fn display_driver_name(config: &DisplayConfig) -> &'static str {
+    match config.driver {
+        DisplayDriver::Ssd1306 => "ssd1306",
+        DisplayDriver::Sh1106 => "sh1106",
+        DisplayDriver::Sh1107 => "sh1107",
+        DisplayDriver::Sh1108 => "sh1108",
+        DisplayDriver::Ssd1309 => "ssd1309",
+        DisplayDriver::Ls0xx => "ls0xx",
     }
 }
 
 fn expand_display_driver_init(config: &DisplayConfig) -> TokenStream {
+    // The Sharp memory LCD takes no I2C address and ignores rotation here.
+    if let DisplayDriver::Ls0xx = config.driver {
+        let (w, h) = parse_ls0xx_size(&config.size);
+        return quote! {
+            let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h>::new(
+                display_spi,
+                ::embassy_nrf::gpio::Output::new(display_cs_pin, ::embassy_nrf::gpio::Level::Low, ::embassy_nrf::gpio::OutputDrive::Standard),
+            );
+        };
+    }
+
     let address = get_i2c_address(config);
     let rotation = match config.rotation {
         0 => quote! { Rotate0 },
@@ -150,6 +218,8 @@ fn expand_display_driver_init(config: &DisplayConfig) -> TokenStream {
                 ).into_buffered_graphics_mode();
             }
         }
+        // Handled above; unreachable here.
+        DisplayDriver::Ls0xx => unreachable!(),
         driver @ (DisplayDriver::Sh1106
         | DisplayDriver::Sh1107
         | DisplayDriver::Sh1108
@@ -205,6 +275,15 @@ fn expand_display_processor_init(config: &DisplayConfig) -> TokenStream {
         let mut display_processor = #constructor
             #render_interval
             #min_render_interval;
+    }
+}
+
+/// Parse the panel size for the Sharp memory LCD. Only the nice!view's 160x68
+/// is supported for now.
+fn parse_ls0xx_size(size: &str) -> (usize, usize) {
+    match size {
+        "160x68" => (160, 68),
+        _ => panic!("Unsupported LS0xx display size '{}'. Supported: 160x68", size),
     }
 }
 

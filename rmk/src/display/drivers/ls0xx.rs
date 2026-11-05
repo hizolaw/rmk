@@ -95,14 +95,16 @@ where
         self.cs.set_high().ok();
 
         // Alternate the VCOM bit every frame: this is the AC drive a Sharp
-        // memory LCD needs, and without it the contrast fades (the image looks
-        // washed out). The panel shows the pixel data inverted while VCOM is
-        // set, so the data is inverted on those frames too - the visible image
-        // stays identical while the pixel field alternates.
+        // memory LCD needs, and without it the contrast fades (washed out).
+        // The panel does NOT invert the data when VCOM changes - it simply
+        // latches the bits as sent - so the pixel data must be identical on
+        // every frame. Keeping the data constant while VCOM alternates gives a
+        // stable image with a proper AC field; flipping the data along with
+        // VCOM made the screen flash black/white.
         //
         // Pixel convention on the wire: 1 = white, 0 = black. `fb` has bit 1
-        // for "On" (drawn content), so the base frame sends `!b` to render a
-        // white background with black content.
+        // for "On" (drawn content), so `!b` renders white background with
+        // black content on every frame.
         let vcom = self.vcom_state;
         self.vcom_state = !vcom;
 
@@ -113,9 +115,8 @@ where
             line[0] = (y + 1) as u8; // gate address is 1-based
             let src = &self.fb[y * per_line..(y + 1) * per_line];
             for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
-                // White background: invert the framebuffer bit. On a VCOM-set
-                // frame the panel inverts again, so send the un-inverted value.
-                *dst = if vcom { b } else { !b };
+                // Constant on every frame: white background / black content.
+                *dst = !b;
             }
             line[1 + per_line] = LINE_DUMMY;
             self.spi.write(&line[..2 + per_line]).await?;

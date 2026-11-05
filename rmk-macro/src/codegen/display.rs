@@ -106,6 +106,16 @@ fn expand_spi_init(chip_series: &ChipSeries, spi: &SpiConfig) -> TokenStream {
         ChipSeries::Nrf52 => {
             let cs = format_ident!("{}", cs);
             quote! {
+                // Put the SPI interrupt below the BLE controller's. The SDC
+                // services RADIO/RTC0/TIMER0 at Priority::P0 and pairing breaks
+                // if a burst of SPI interrupts (a full frame) delays them; the
+                // SPI interrupt must therefore never preempt them.
+                {
+                    use ::embassy_nrf::interrupt::typelevel::Interrupt as _;
+                    ::embassy_nrf::interrupt::typelevel::#instance::set_priority(
+                        ::embassy_nrf::interrupt::Priority::P7,
+                    );
+                }
                 let display_spi = {
                     use ::embassy_nrf::spim::{Frequency, Spim, Config, MODE_0};
                     let mut cfg = Config::default();
@@ -187,8 +197,10 @@ fn expand_display_driver_init(config: &DisplayConfig) -> TokenStream {
     if let DisplayDriver::Ls0xx = config.driver {
         let (w, h) = parse_ls0xx_size(&config.size);
         let fb = w * h / 8;
+        // start byte + H lines of (1 line# + W/8 pixels + 1 dummy) + latch
+        let tx = 1 + h * (w / 8 + 2) + 1;
         return quote! {
-            let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h, #fb>::new(
+            let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h, #fb, #tx>::new(
                 display_spi,
                 ::embassy_nrf::gpio::Output::new(display_cs_pin, ::embassy_nrf::gpio::Level::Low, ::embassy_nrf::gpio::OutputDrive::Standard),
             );

@@ -2,8 +2,7 @@
 //!
 //! The nice!view is a 160x68 Sharp LS0xx panel with one bit per pixel. The wire
 //! protocol follows Zephyr's long-used `drivers/display/ls0xx.c` because
-//! nice!view uses the `sharp,ls0xx` variant (the generic `memory-lcd-spi` crate
-//! targets a slightly different command set):
+//! nice!view uses the `sharp,ls0xx` variant:
 //!
 //! * a frame starts with a write-command byte (bit 0) that also carries the
 //!   VCOM polarity, and that polarity flips once per frame;
@@ -11,12 +10,20 @@
 //!   numbers starting at 1;
 //! * a trailing write byte latches the last line.
 //!
-//! The panel needs its VCOM polarity flipped regularly or it accumulates a DC
-//! bias and fades. [`DisplayDriver::flush`] flips it every frame, so configure a
-//! periodic redraw (`render_interval` in `keyboard.toml`) to keep it healthy
-//! while idle.
+//! Two things here differ from a naive port, both to keep the radio happy:
 //!
-//! All bus access is `async`; nothing here blocks the executor.
+//! * **One SPI transaction per frame.** The line numbers and dummy bytes are
+//!   interleaved into a single contiguous transmit buffer, so a frame raises a
+//!   single SPI "end" interrupt instead of one per gate line. On nRF the BLE
+//!   controller depends on its interrupt being serviced promptly, and a burst
+//!   of same-priority SPI interrupts delays it enough to break pairing.
+//! * **VCOM is its own timer.** The panel needs VCOM flipped every few tens of
+//!   milliseconds or the image fades from accumulated DC bias, independent of
+//!   how often the screen is redrawn. [`Ls0xxDisplay::vcom_tick`] sends a bare
+//!   VCOM command and is meant to run on a ~33ms ticker.
+//!
+//! The interrupt priority is set by the caller in generated code (see
+//! `expand_spi_init`), not here, because it needs the interrupt type.
 
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
@@ -29,24 +36,35 @@ use crate::display::DisplayDriver;
 const BIT_WRITECMD: u8 = 0x01;
 const BIT_VCOM: u8 = 0x02;
 
-/// Bytes per gate line: one bit per pixel, `W` is a multiple of 8.
+/// Bytes of pixel data per gate line: one bit per pixel, `W` is a multiple of 8.
 const fn bytes_per_line<const W: usize>() -> usize {
     W >> 3
 }
 
+/// Bytes needed to send one whole frame in a single SPI transaction:
+/// start command + `H` lines of `[line#, pixels, dummy]` + trailing latch.
+const fn txn_len<const W: usize, const H: usize>() -> usize {
+    1 + H * (bytes_per_line::<W>() + 2) + 1
+}
+
 /// A Sharp memory LCD over an async SPI bus.
 ///
-/// `W`/`H` are the panel resolution in pixels; the framebuffer is `W * H / 8`
-/// bytes (one bit per pixel). `SPI` is an async SPI bus (e.g.
-/// `embassy_nrf::spim::Spim<'static, Async>`), `CS` an active-high chip select.
-pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize> {
+/// `W`/`H` are the panel resolution; `FB` is `W * H / 8` (the framebuffer
+/// length) and `TX` is [`txn_len`], both passed explicitly because stable Rust
+/// does not allow const arithmetic on generic parameters.
+pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> {
     spi: SPI,
     cs: CS,
     fb: [u8; FB],
+    tx: [u8; TX],
     vcom: bool,
+    /// Set only when a pixel's bit actually changed, so an idle redraw can skip
+    /// the whole frame and just flip VCOM.
+    dirty: bool,
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize> Ls0xxDisplay<SPI, CS, W, H, FB>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize>
+    Ls0xxDisplay<SPI, CS, W, H, FB, TX>
 where
     SPI: SpiBus<u8>,
     CS: OutputPin,
@@ -56,50 +74,69 @@ where
             spi,
             cs,
             fb: [0; FB],
+            tx: [0; TX],
             vcom: false,
+            dirty: true,
         }
     }
 
-    /// Command/flags byte carrying the current VCOM polarity.
     fn flags(&self, base: u8) -> u8 {
         if self.vcom { base | BIT_VCOM } else { base }
     }
 
-    /// Send the whole framebuffer to the panel, flipping VCOM for this frame.
-    async fn write_frame(&mut self) -> Result<(), SPI::Error> {
+    /// Pack the framebuffer into `tx` as one contiguous frame.
+    fn pack(&mut self) {
         let per_line = bytes_per_line::<W>();
-        // One gate line: 1 line-number byte + pixels + 1 dummy byte.
-        let mut line = [0u8; 1 + 32 + 1];
 
-        self.cs.set_high().ok();
-
-        // Frame start; this byte decides the VCOM polarity for the frame.
-        let start = self.flags(BIT_WRITECMD);
+        // Frame start; this byte fixes the VCOM polarity for the frame.
+        self.tx[0] = self.flags(BIT_WRITECMD);
         self.vcom = !self.vcom;
-        self.spi.write(&[start]).await?;
 
+        let mut out = 1;
         for y in 0..H {
-            line[0] = (y + 1) as u8;
-            line[1..1 + per_line].copy_from_slice(&self.fb[y * per_line..(y + 1) * per_line]);
-            line[1 + per_line] = 0x00;
-            self.spi.write(&line[..2 + per_line]).await?;
+            let src = y * per_line;
+            self.tx[out] = (y + 1) as u8; // 1-based line number
+            self.tx[out + 1..out + 1 + per_line].copy_from_slice(&self.fb[src..src + per_line]);
+            self.tx[out + 1 + per_line] = 0x00; // dummy byte
+            out += per_line + 2;
         }
 
         // Trailing byte latches the last line; its value is ignored.
-        self.spi.write(&[self.flags(BIT_WRITECMD)]).await?;
+        self.tx[out] = self.flags(BIT_WRITECMD);
+    }
 
+    /// Push the framebuffer to the panel in a single SPI transaction.
+    async fn write_frame(&mut self) -> Result<(), SPI::Error> {
+        self.pack();
+        self.cs.set_high().ok();
+        let result = self.spi.write(&self.tx).await;
         self.cs.set_low().ok();
-        Ok(())
+        result
+    }
+
+    /// Flip VCOM with a bare command. Call this on a ~33ms ticker so the panel
+    /// keeps its contrast while the screen is not being redrawn.
+    pub async fn vcom_tick(&mut self) -> Result<(), SPI::Error> {
+        let cmd = self.flags(BIT_VCOM);
+        self.vcom = !self.vcom;
+        self.cs.set_high().ok();
+        let result = self.spi.write(&[cmd]).await;
+        self.cs.set_low().ok();
+        result
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions for Ls0xxDisplay<SPI, CS, W, H, FB> {
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> OriginDimensions
+    for Ls0xxDisplay<SPI, CS, W, H, FB, TX>
+{
     fn size(&self) -> Size {
         Size::new(W as u32, H as u32)
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget for Ls0xxDisplay<SPI, CS, W, H, FB> {
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> DrawTarget
+    for Ls0xxDisplay<SPI, CS, W, H, FB, TX>
+{
     type Color = BinaryColor;
     type Error = core::convert::Infallible;
 
@@ -114,27 +151,40 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget for Ls
             let (x, y) = (pt.x as usize, pt.y as usize);
             let index = y * bytes_per_line::<W>() + x / 8;
             let mask = 0x80 >> (x % 8);
+            let before = self.fb[index];
             match color {
                 BinaryColor::On => self.fb[index] |= mask,
                 BinaryColor::Off => self.fb[index] &= !mask,
+            }
+            if self.fb[index] != before {
+                self.dirty = true;
             }
         }
         Ok(())
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DisplayDriver for Ls0xxDisplay<SPI, CS, W, H, FB>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> DisplayDriver
+    for Ls0xxDisplay<SPI, CS, W, H, FB, TX>
 where
     SPI: SpiBus<u8>,
     CS: OutputPin,
 {
     async fn init(&mut self) {
-        // Start from a known-blank panel.
         self.fb.fill(0);
+        self.dirty = true;
         let _ = self.write_frame().await;
+        self.dirty = false;
     }
 
     async fn flush(&mut self) {
-        let _ = self.write_frame().await;
+        if self.dirty {
+            // Content changed: repaint the whole panel (one SPI transaction).
+            let _ = self.write_frame().await;
+            self.dirty = false;
+        } else {
+            // Nothing to redraw: just flip VCOM so the image keeps contrast.
+            let _ = self.vcom_tick().await;
+        }
     }
 }

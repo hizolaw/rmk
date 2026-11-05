@@ -41,30 +41,22 @@ const fn bytes_per_line<const W: usize>() -> usize {
     W >> 3
 }
 
-/// Bytes needed to send one whole frame in a single SPI transaction:
-/// start command + `H` lines of `[line#, pixels, dummy]` + trailing latch.
-const fn txn_len<const W: usize, const H: usize>() -> usize {
-    1 + H * (bytes_per_line::<W>() + 2) + 1
-}
-
 /// A Sharp memory LCD over an async SPI bus.
 ///
 /// `W`/`H` are the panel resolution; `FB` is `W * H / 8` (the framebuffer
-/// length) and `TX` is [`txn_len`], both passed explicitly because stable Rust
-/// does not allow const arithmetic on generic parameters.
-pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> {
+/// length), passed explicitly because stable Rust does not allow const
+/// arithmetic on generic parameters.
+pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize> {
     spi: SPI,
     cs: CS,
     fb: [u8; FB],
-    tx: [u8; TX],
     vcom: bool,
     /// Set only when a pixel's bit actually changed, so an idle redraw can skip
     /// the whole frame and just flip VCOM.
     dirty: bool,
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize>
-    Ls0xxDisplay<SPI, CS, W, H, FB, TX>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> Ls0xxDisplay<SPI, CS, W, H, FB>
 where
     SPI: SpiBus<u8>,
     CS: OutputPin,
@@ -74,7 +66,6 @@ where
             spi,
             cs,
             fb: [0; FB],
-            tx: [0; TX],
             vcom: false,
             dirty: true,
         }
@@ -84,34 +75,33 @@ where
         if self.vcom { base | BIT_VCOM } else { base }
     }
 
-    /// Pack the framebuffer into `tx` as one contiguous frame.
-    fn pack(&mut self) {
+    /// Push the framebuffer to the panel, one gate line per SPI transaction.
+    ///
+    /// This is what Zephyr's ls0xx driver does, and the panel is picky: a
+    /// single merged burst did not display at all on the nice!view. Keeping
+    /// each line as its own transaction costs one SPI interrupt per line but is
+    /// the known-good sequence.
+    async fn write_frame(&mut self) -> Result<(), SPI::Error> {
         let per_line = bytes_per_line::<W>();
+        let mut line = [0u8; 1 + 32 + 1];
 
-        // Frame start; this byte fixes the VCOM polarity for the frame.
-        self.tx[0] = self.flags(BIT_WRITECMD);
+        self.cs.set_high().ok();
+
+        let start = self.flags(BIT_WRITECMD);
         self.vcom = !self.vcom;
+        self.spi.write(&[start]).await?;
 
-        let mut out = 1;
         for y in 0..H {
-            let src = y * per_line;
-            self.tx[out] = (y + 1) as u8; // 1-based line number
-            self.tx[out + 1..out + 1 + per_line].copy_from_slice(&self.fb[src..src + per_line]);
-            self.tx[out + 1 + per_line] = 0x00; // dummy byte
-            out += per_line + 2;
+            line[0] = (y + 1) as u8;
+            line[1..1 + per_line].copy_from_slice(&self.fb[y * per_line..(y + 1) * per_line]);
+            line[1 + per_line] = 0x00;
+            self.spi.write(&line[..2 + per_line]).await?;
         }
 
-        // Trailing byte latches the last line; its value is ignored.
-        self.tx[out] = self.flags(BIT_WRITECMD);
-    }
+        self.spi.write(&[self.flags(BIT_WRITECMD)]).await?;
 
-    /// Push the framebuffer to the panel in a single SPI transaction.
-    async fn write_frame(&mut self) -> Result<(), SPI::Error> {
-        self.pack();
-        self.cs.set_high().ok();
-        let result = self.spi.write(&self.tx).await;
         self.cs.set_low().ok();
-        result
+        Ok(())
     }
 
     /// Flip VCOM with a bare command. Call this on a ~33ms ticker so the panel
@@ -126,16 +116,16 @@ where
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> OriginDimensions
-    for Ls0xxDisplay<SPI, CS, W, H, FB, TX>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions
+    for Ls0xxDisplay<SPI, CS, W, H, FB>
 {
     fn size(&self) -> Size {
         Size::new(W as u32, H as u32)
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> DrawTarget
-    for Ls0xxDisplay<SPI, CS, W, H, FB, TX>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget
+    for Ls0xxDisplay<SPI, CS, W, H, FB>
 {
     type Color = BinaryColor;
     type Error = core::convert::Infallible;
@@ -164,8 +154,8 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> 
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize, const FB: usize, const TX: usize> DisplayDriver
-    for Ls0xxDisplay<SPI, CS, W, H, FB, TX>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DisplayDriver
+    for Ls0xxDisplay<SPI, CS, W, H, FB>
 where
     SPI: SpiBus<u8>,
     CS: OutputPin,
@@ -179,12 +169,14 @@ where
 
     async fn flush(&mut self) {
         if self.dirty {
-            // Content changed: repaint the whole panel (one SPI transaction).
             let _ = self.write_frame().await;
             self.dirty = false;
-        } else {
-            // Nothing to redraw: just flip VCOM so the image keeps contrast.
-            let _ = self.vcom_tick().await;
         }
+    }
+
+    async fn tick(&mut self) {
+        // VCOM heartbeat: independent of redraws so an idle screen keeps its
+        // contrast. The interval is set with with_vcom_interval().
+        let _ = self.vcom_tick().await;
     }
 }

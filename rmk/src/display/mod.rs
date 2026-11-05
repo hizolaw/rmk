@@ -171,6 +171,16 @@ pub trait DisplayDriver: DrawTarget {
     fn init(&mut self) -> impl core::future::Future<Output = ()>;
     /// Flush the framebuffer to the display.
     fn flush(&mut self) -> impl core::future::Future<Output = ()>;
+    /// Periodic housekeeping that is independent of redraws.
+    ///
+    /// Memory LCDs (nice!view) must flip their VCOM polarity every few tens of
+    /// milliseconds or the image fades, even when nothing on screen changes.
+    /// [`DisplayProcessor::with_vcom_interval`] drives this on its own timer, so
+    /// it must stay cheap — a driver that has nothing to do should inherit the
+    /// default no-op.
+    fn tick(&mut self) -> impl core::future::Future<Output = ()> {
+        async {}
+    }
 }
 
 /// Trait for custom display renderers.
@@ -243,6 +253,8 @@ where
     min_render_interval: Duration,
     /// Poll interval for animations. `None` disables polling (event-driven only).
     render_interval: Option<Duration>,
+    /// Independent tick interval for [`DisplayDriver::tick`] (memory-LCD VCOM).
+    vcom_interval: Option<Duration>,
 }
 
 impl<D> DisplayProcessor<D, LogoRenderer>
@@ -279,6 +291,7 @@ where
             pending_render: false,
             min_render_interval: Duration::from_millis(33),
             render_interval: None,
+            vcom_interval: None,
         }
     }
 
@@ -288,6 +301,16 @@ where
     /// Without this, the display only redraws when keyboard state changes.
     pub fn with_render_interval(mut self, interval: Duration) -> Self {
         self.render_interval = Some(interval);
+        self
+    }
+
+    /// Drive [`DisplayDriver::tick`] on this interval, independently of redraws.
+    ///
+    /// Needed by memory LCDs, whose VCOM must keep flipping while the screen is
+    /// idle. Keep it separate from `render_interval`: a periodic *redraw* would
+    /// repaint the whole panel every tick, which is far too expensive.
+    pub fn with_vcom_interval(mut self, interval: Duration) -> Self {
+        self.vcom_interval = Some(interval);
         self
     }
 
@@ -428,6 +451,7 @@ where
         self.pending_render = true;
         self.render().await;
         let mut ticker = self.render_interval.map(Ticker::every);
+        let mut vcom_ticker = self.vcom_interval.map(Ticker::every);
 
         loop {
             if !self.ctx.sleeping {
@@ -454,11 +478,18 @@ where
                         Either::First(_) => self.render().await,
                         Either::Second(event) => self.process(event).await,
                     },
-                    // Event-driven mode with nothing pending: just block on events.
-                    (None, None) => {
-                        let event = sub.next_event().await;
-                        self.process(event).await;
-                    }
+                    // Event-driven mode with nothing pending: block on events, or
+                    // service the VCOM tick for memory LCDs.
+                    (None, None) => match vcom_ticker.as_mut() {
+                        Some(v) => match select(v.next(), sub.next_event()).await {
+                            Either::First(_) => self.display.tick().await,
+                            Either::Second(event) => self.process(event).await,
+                        },
+                        None => {
+                            let event = sub.next_event().await;
+                            self.process(event).await;
+                        }
+                    },
                 }
             } else {
                 // While sleeping, ignore timers and wait only for state changes.

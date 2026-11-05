@@ -197,10 +197,8 @@ fn expand_display_driver_init(config: &DisplayConfig) -> TokenStream {
     if let DisplayDriver::Ls0xx = config.driver {
         let (w, h) = parse_ls0xx_size(&config.size);
         let fb = w * h / 8;
-        // start byte + H lines of (1 line# + W/8 pixels + 1 dummy) + latch
-        let tx = 1 + h * (w / 8 + 2) + 1;
         return quote! {
-            let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h, #fb, #tx>::new(
+            let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h, #fb>::new(
                 display_spi,
                 ::embassy_nrf::gpio::Output::new(display_cs_pin, ::embassy_nrf::gpio::Level::Low, ::embassy_nrf::gpio::OutputDrive::Standard),
             );
@@ -284,10 +282,29 @@ fn expand_display_processor_init(config: &DisplayConfig) -> TokenStream {
         }
     });
 
+    // Memory LCDs need a VCOM flip every few tens of ms regardless of redraws.
+    // Use `render_interval` as that heartbeat for ls0xx and do NOT pass it to
+    // `with_render_interval`: a periodic full redraw would repaint all 68 gate
+    // lines every tick, which starves the BLE stack.
+    let vcom_interval = if matches!(config.driver, DisplayDriver::Ls0xx) {
+        let ms = config.render_interval.unwrap_or(33);
+        quote! {
+            .with_vcom_interval(::embassy_time::Duration::from_millis(#ms))
+        }
+    } else {
+        quote! {}
+    };
+    let render_interval = if matches!(config.driver, DisplayDriver::Ls0xx) {
+        quote! {}
+    } else {
+        render_interval
+    };
+
     quote! {
         let mut display_processor = #constructor
             #render_interval
-            #min_render_interval;
+            #min_render_interval
+            #vcom_interval;
     }
 }
 

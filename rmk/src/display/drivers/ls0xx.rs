@@ -54,11 +54,13 @@ const fn bytes_per_line<const W: usize>() -> usize {
 pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize> {
     spi: SPI,
     cs: CS,
+    /// What the renderer draws into.
     fb: [u8; FB],
+    /// What was last sent to the panel. flush() compares against this, so a
+    /// renderer that clears and repaints identical content does not cause a
+    /// visible full-frame repaint.
+    shown: [u8; FB],
     vcom: bool,
-    /// Set only when a pixel's bit actually changed, so an idle redraw can skip
-    /// the whole frame and just flip VCOM.
-    dirty: bool,
 }
 
 impl<SPI, CS, const W: usize, const H: usize, const FB: usize> Ls0xxDisplay<SPI, CS, W, H, FB>
@@ -71,8 +73,8 @@ where
             spi,
             cs,
             fb: [0; FB],
+            shown: [0xFF; FB],
             vcom: false,
-            dirty: true,
         }
     }
 
@@ -148,13 +150,9 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget
             let (x, y) = (pt.x as usize, pt.y as usize);
             let index = y * bytes_per_line::<W>() + x / 8;
             let mask = 0x80 >> (x % 8);
-            let before = self.fb[index];
             match color {
                 BinaryColor::On => self.fb[index] |= mask,
                 BinaryColor::Off => self.fb[index] &= !mask,
-            }
-            if self.fb[index] != before {
-                self.dirty = true;
             }
         }
         Ok(())
@@ -169,15 +167,16 @@ where
 {
     async fn init(&mut self) {
         self.fb.fill(0);
-        self.dirty = true;
         let _ = self.write_frame().await;
-        self.dirty = false;
+        self.shown.copy_from_slice(&self.fb);
     }
 
     async fn flush(&mut self) {
-        if self.dirty {
+        // Only touch the panel when the rendered image actually differs from
+        // what is already on it (see `shown`).
+        if self.fb != self.shown {
             let _ = self.write_frame().await;
-            self.dirty = false;
+            self.shown.copy_from_slice(&self.fb);
         }
     }
 

@@ -104,10 +104,15 @@ where
             self.spi.write(&line[..2 + per_line]).await?;
         }
 
-        // Trailing command that latches the last line, carrying VCOM like
-        // Zephyr's second `ls0xx_cmd` call.
-        let end = self.next_cmd(BIT_WRITECMD);
-        self.spi.write(&[end]).await?;
+        // Trailing command that latches the last line. It does NOT carry VCOM,
+        // so a frame flips polarity exactly once (at the start command). Then
+        // consecutive frames alternate polarity, which is what actually drives
+        // each pixel to its new state: a pixel only latches when it is written
+        // with the opposite VCOM polarity to its previous write. If both the
+        // start and end commands carried VCOM the frame would flip twice and
+        // every frame would use the same polarity, leaving old pixels stuck -
+        // the previous image showing through.
+        self.spi.write(&[BIT_WRITECMD]).await?;
 
         self.cs.set_low().ok();
         Ok(())
@@ -164,19 +169,31 @@ where
     CS: OutputPin,
 {
     async fn init(&mut self) {
-        // The panel keeps its last image across MCU resets (it is memory LCD).
-        // Without this the previous firmware's content stays on screen.
+        // A memory LCD holds the previous firmware's image across MCU resets,
+        // and long DC-biased driving leaves "image sticking" (ions piled up
+        // near the electrodes) that fades the old picture through the new one.
+        //
+        // The hardware CLEAR forces every pixel white. Then drive a few
+        // full-white and full-black frames: write_frame flips VCOM once per
+        // frame, so alternating white/black frames push every pixel through
+        // both states repeatedly, which exercises the sticking away. Only then
+        // paint the real content.
         let _ = self.clear_panel().await;
         embassy_time::Timer::after_millis(10).await;
 
-        // Zap the previous firmware's image. The hardware CLEAR sets every
-        // pixel white; the extra blank frames then drive the pixels again so a
-        // stale polarized state cannot survive.
-        self.fb.fill(0);
         for _ in 0..3 {
+            self.fb.fill(0xFF); // all white
+            let _ = self.write_frame().await;
+            embassy_time::Timer::after_millis(5).await;
+
+            self.fb.fill(0x00); // all black
             let _ = self.write_frame().await;
             embassy_time::Timer::after_millis(5).await;
         }
+
+        // Blank for the first real paint; the renderer decides the content.
+        self.fb.fill(0);
+        let _ = self.write_frame().await;
         self.shown.copy_from_slice(&self.fb);
     }
 

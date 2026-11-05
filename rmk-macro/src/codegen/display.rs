@@ -286,12 +286,13 @@ fn expand_display_processor_init(config: &DisplayConfig) -> TokenStream {
         }
     });
 
-    // Memory LCDs need a VCOM flip every few tens of ms regardless of redraws.
-    // Use `render_interval` as that heartbeat for ls0xx and do NOT pass it to
-    // `with_render_interval`: a periodic full redraw would repaint all 68 gate
-    // lines every tick, which starves the BLE stack.
+    // A memory LCD has to keep being driven or its image fades. Use
+    // `render_interval` as the ls0xx refresh period (via with_vcom_interval)
+    // and do NOT pass it to `with_render_interval`: this repaints a whole
+    // frame, so the value should be slow (hundreds of ms) - fast full-frame
+    // redraws starve the BLE stack.
     let vcom_interval = if matches!(config.driver, DisplayDriver::Ls0xx) {
-        let ms = config.render_interval.unwrap_or(33);
+        let ms = config.render_interval.unwrap_or(500);
         quote! {
             .with_vcom_interval(::embassy_time::Duration::from_millis(#ms))
         }

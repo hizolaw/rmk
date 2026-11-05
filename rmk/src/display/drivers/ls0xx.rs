@@ -1,29 +1,18 @@
 //! [`DisplayDriver`] adapter for Sharp memory LCDs over SPI.
 //!
-//! The nice!view is a 160x68 Sharp LS0xx panel with one bit per pixel. The wire
-//! protocol follows Zephyr's long-used `drivers/display/ls0xx.c` because
-//! nice!view uses the `sharp,ls0xx` variant:
+//! The nice!view is a 160x68 Sharp LS0xx panel, one bit per pixel. The wire
+//! protocol mirrors the Rust `memory-lcd-spi` driver (the one known to work
+//! with this panel) with Zephyr's command bit values:
 //!
-//! * a frame starts with a write-command byte (bit 0) that also carries the
-//!   VCOM polarity, and that polarity flips once per frame;
-//! * each gate line is `[line_number, W/8 data bytes, dummy_byte]`, with line
-//!   numbers starting at 1;
+//! * every command byte carries the VCOM polarity bit, which flips each time;
+//! * each gate line is `[line_number, W/8 data bytes, dummy_byte]`, line
+//!   numbers from 1, dummy byte 27;
 //! * a trailing write byte latches the last line.
 //!
-//! Two things here differ from a naive port, both to keep the radio happy:
-//!
-//! * **One SPI transaction per frame.** The line numbers and dummy bytes are
-//!   interleaved into a single contiguous transmit buffer, so a frame raises a
-//!   single SPI "end" interrupt instead of one per gate line. On nRF the BLE
-//!   controller depends on its interrupt being serviced promptly, and a burst
-//!   of same-priority SPI interrupts delays it enough to break pairing.
-//! * **VCOM is its own timer.** The panel needs VCOM flipped every few tens of
-//!   milliseconds or the image fades from accumulated DC bias, independent of
-//!   how often the screen is redrawn. [`Ls0xxDisplay::vcom_tick`] sends a bare
-//!   VCOM command and is meant to run on a ~33ms ticker.
-//!
-//! The interrupt priority is set by the caller in generated code (see
-//! `expand_spi_init`), not here, because it needs the interrupt type.
+//! VCOM is carried by the real frame writes. There is intentionally **no**
+//! standalone VCOM ping: a bare VCOM command with no pixel data made the panel
+//! shimmer and fade, because this driver repaints only on state changes rather
+//! than continuously like Zephyr's LVGL loop.
 
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
@@ -124,15 +113,12 @@ where
         Ok(())
     }
 
-    /// Zephyr's idle VCOM ping: `[0x00 | vcom, 0x00]`, flipping the shared
-    /// polarity. Send it every ~33 ms; without it the image fades.
-    pub async fn vcom_tick(&mut self) -> Result<(), SPI::Error> {
-        let cmd = self.next_cmd(0x00);
-        self.cs.set_high().ok();
-        let result = self.spi.write(&[cmd, 0x00]).await;
-        self.cs.set_low().ok();
-        result
-    }
+    // A standalone VCOM ping is deliberately NOT provided. Sending a bare
+    // VCOM command with no pixel data (Zephyr does this from its own thread)
+    // made the nice!view shimmer and fade here: that driver repaints whole
+    // frames continuously through LVGL, while this one only repaints on state
+    // changes. `memory-lcd-spi`, the driver that works with this panel in
+    // Rust, likewise never pings - VCOM is carried by each real frame.
 }
 
 impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions
@@ -204,8 +190,12 @@ where
     }
 
     async fn tick(&mut self) {
-        // VCOM heartbeat: independent of redraws so an idle screen keeps its
-        // contrast. The interval is set with with_vcom_interval().
-        let _ = self.vcom_tick().await;
+        // A memory LCD only holds its image while it keeps being driven with
+        // alternating VCOM. A bare VCOM ping (no pixel data) shimmered, and
+        // repainting every 33ms starved the BLE stack. So repaint the whole
+        // frame on a slow timer (set via with_vcom_interval) - frequent enough
+        // to hold contrast, cheap enough not to disturb the radio.
+        let _ = self.write_frame().await;
+        self.shown.copy_from_slice(&self.fb);
     }
 }

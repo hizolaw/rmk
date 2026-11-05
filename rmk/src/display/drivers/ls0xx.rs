@@ -34,14 +34,14 @@ const BIT_VCOM: u8 = 0x02;
 /// `W`/`H` are the panel resolution in pixels; the framebuffer is `W * H / 8`
 /// bytes (one bit per pixel). `SPI` is an async SPI bus (e.g.
 /// `embassy_nrf::spim::Spim<'static, Async>`), `CS` an active-high chip select.
-pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize> {
+pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize> {
     spi: SPI,
     cs: CS,
-    fb: [u8; W * H / 8],
+    fb: [u8; FB],
     vcom: bool,
 }
 
-impl<SPI, CS, const W: usize, const H: usize> Ls0xxDisplay<SPI, CS, W, H>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> Ls0xxDisplay<SPI, CS, W, H, FB>
 where
     SPI: SpiBus<u8>,
     CS: OutputPin,
@@ -56,7 +56,8 @@ where
     }
 
     fn bytes_per_line() -> usize {
-        W / 8
+        // W is always a multiple of 8 for these panels.
+        W >> 3
     }
 
     /// Command/flags byte carrying the current VCOM polarity.
@@ -68,7 +69,8 @@ where
     async fn write_frame(&mut self) -> Result<(), SPI::Error> {
         let per_line = Self::bytes_per_line();
         // One gate line: 1 line-number byte + pixels + 1 dummy byte.
-        let mut line = [0u8; 1 + W / 8 + 1];
+        let per_line = Self::bytes_per_line();
+        let mut line = [0u8; 1 + 32 + 1];
 
         self.cs.set_high().ok();
 
@@ -92,13 +94,13 @@ where
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize> OriginDimensions for Ls0xxDisplay<SPI, CS, W, H> {
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions for Ls0xxDisplay<SPI, CS, W, H, FB> {
     fn size(&self) -> Size {
         Size::new(W as u32, H as u32)
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize> DrawTarget for Ls0xxDisplay<SPI, CS, W, H> {
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget for Ls0xxDisplay<SPI, CS, W, H, FB> {
     type Color = BinaryColor;
     type Error = core::convert::Infallible;
 
@@ -122,7 +124,7 @@ impl<SPI, CS, const W: usize, const H: usize> DrawTarget for Ls0xxDisplay<SPI, C
     }
 }
 
-impl<SPI, CS, const W: usize, const H: usize> DisplayDriver for Ls0xxDisplay<SPI, CS, W, H>
+impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DisplayDriver for Ls0xxDisplay<SPI, CS, W, H, FB>
 where
     SPI: SpiBus<u8>,
     CS: OutputPin,

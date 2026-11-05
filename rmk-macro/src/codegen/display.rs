@@ -186,8 +186,9 @@ fn expand_display_driver_init(config: &DisplayConfig) -> TokenStream {
     // The Sharp memory LCD takes no I2C address and ignores rotation here.
     if let DisplayDriver::Ls0xx = config.driver {
         let (w, h) = parse_ls0xx_size(&config.size);
+        let fb = w * h / 8;
         return quote! {
-            let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h>::new(
+            let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h, #fb>::new(
                 display_spi,
                 ::embassy_nrf::gpio::Output::new(display_cs_pin, ::embassy_nrf::gpio::Level::Low, ::embassy_nrf::gpio::OutputDrive::Standard),
             );

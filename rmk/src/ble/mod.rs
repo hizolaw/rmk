@@ -272,12 +272,7 @@ async fn run_ble_keyboard<
     let profile_manager = &mut profile_manager;
 
     let connection_loop = async {
-        // Once the bonded host has been given a chance to reconnect, fall back
-        // to open advertising so any host can (re)pair this profile.
-        const FILTERED_ADV_WINDOW: Duration = Duration::from_secs(30);
-        let mut filtered_adv_start = Instant::now();
         loop {
-            let filtered_adv_expired = filtered_adv_start.elapsed() >= FILTERED_ADV_WINDOW;
             // On the dongle slot, advertise directed to the bonded dongle or
             // as a seeking broadcast; on the normal profiles, plain HID.
             #[cfg(feature = "dongle")]
@@ -290,19 +285,7 @@ async fn run_ble_keyboard<
                 Adv::Host { name: product_name }
             };
             #[cfg(not(feature = "dongle"))]
-            let adv = match profile_manager.active_bond_info() {
-                // A paired profile advertises only to its bonded host, so no
-                // other host in range can take the connection and fail
-                // encryption (which showed up as a connect/disconnect loop).
-                // It does so only for a bounded window: a bond whose host is
-                // gone (or changed address) would otherwise never let anyone
-                // connect, leaving no way to re-pair without clearing storage.
-                Some(info) if !filtered_adv_expired => Adv::BondedHost {
-                    name: product_name,
-                    addr: info.info.identity.addr,
-                },
-                _ => Adv::Host { name: product_name },
-            };
+            let adv = Adv::Host { name: product_name };
 
             // Wait for 10ms to ensure the USB is checked
             Timer::after_millis(10).await;
@@ -356,7 +339,6 @@ async fn run_ble_keyboard<
                     {
                         // When the profile changes, manually disconnect from the current host
                         disconnect(&conn).await;
-                        filtered_adv_start = Instant::now();
                     }
                 }
                 Either::First(Err(BleHostError::BleHost(Error::Timeout))) => {

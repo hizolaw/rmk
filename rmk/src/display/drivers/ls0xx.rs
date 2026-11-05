@@ -36,6 +36,11 @@ use crate::display::DisplayDriver;
 const BIT_WRITECMD: u8 = 0x01;
 const BIT_VCOM: u8 = 0x02;
 
+/// Trailing byte after each gate line's pixels. The first working version sent
+/// 0x00 here and the panel displayed content, so keep that rather than Zephyr's
+/// 27 — the value is not what made the screen blank.
+const LINE_DUMMY: u8 = 0x00;
+
 /// Bytes of pixel data per gate line: one bit per pixel, `W` is a multiple of 8.
 const fn bytes_per_line<const W: usize>() -> usize {
     W >> 3
@@ -94,7 +99,7 @@ where
         for y in 0..H {
             line[0] = (y + 1) as u8;
             line[1..1 + per_line].copy_from_slice(&self.fb[y * per_line..(y + 1) * per_line]);
-            line[1 + per_line] = 0x00;
+            line[1 + per_line] = LINE_DUMMY;
             self.spi.write(&line[..2 + per_line]).await?;
         }
 
@@ -106,6 +111,7 @@ where
 
     /// Flip VCOM with a bare command. Call this on a ~33ms ticker so the panel
     /// keeps its contrast while the screen is not being redrawn.
+    ///
     pub async fn vcom_tick(&mut self) -> Result<(), SPI::Error> {
         let cmd = self.flags(BIT_VCOM);
         self.vcom = !self.vcom;
@@ -114,6 +120,7 @@ where
         self.cs.set_low().ok();
         result
     }
+
 }
 
 impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions

@@ -117,10 +117,14 @@ fn expand_spi_init(chip_series: &ChipSeries, spi: &SpiConfig) -> TokenStream {
                     );
                 }
                 let display_spi = {
-                    use ::embassy_nrf::spim::{Frequency, Spim, Config, MODE_0};
+                    use ::embassy_nrf::spim::{Frequency, Spim, Config, MODE_0, BitOrder};
                     let mut cfg = Config::default();
                     cfg.frequency = Frequency::M1;
                     cfg.mode = MODE_0;
+                    // Sharp LS0xx expects LSB-first bytes (Zephyr uses
+                    // SPI_TRANSFER_LSB); the driver default is MSB-first, which
+                    // makes the panel show nothing useful.
+                    cfg.bit_order = BitOrder::LsbFirst;
                     Spim::new(p.#instance, Irqs, p.#sck, p.#miso, p.#mosi, cfg)
                 };
                 let display_cs_pin = p.#cs;

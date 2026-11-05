@@ -55,7 +55,7 @@ where
         Self {
             spi,
             cs,
-            fb: [0; W * H / 8],
+            fb: [0; FB],
             vcom: false,
         }
     }

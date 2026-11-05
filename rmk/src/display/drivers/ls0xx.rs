@@ -37,10 +37,8 @@ const BIT_WRITECMD: u8 = 0x01;
 const BIT_VCOM: u8 = 0x02;
 const BIT_CLEAR: u8 = 0x04;
 
-/// Trailing byte after each gate line's pixels. The first working version sent
-/// 0x00 here and the panel displayed content, so keep that rather than Zephyr's
-/// 27 — the value is not what made the screen blank.
-const LINE_DUMMY: u8 = 0x00;
+/// Trailing byte after each gate line's pixels, exactly as Zephyr sends it.
+const LINE_DUMMY: u8 = 27;
 
 /// Bytes of pixel data per gate line: one bit per pixel, `W` is a multiple of 8.
 const fn bytes_per_line<const W: usize>() -> usize {
@@ -55,13 +53,14 @@ const fn bytes_per_line<const W: usize>() -> usize {
 pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize> {
     spi: SPI,
     cs: CS,
-    /// What the renderer draws into.
     fb: [u8; FB],
-    /// What was last sent to the panel. flush() compares against this, so a
-    /// renderer that clears and repaints identical content does not cause a
-    /// visible full-frame repaint.
     shown: [u8; FB],
-    vcom: bool,
+    /// Single VCOM polarity, exactly like Zephyr's `ls0xx_data.vcom_state`:
+    /// it flips on *every* command byte sent (clear, frame start, frame end,
+    /// idle ping). Keeping one shared flag is what makes the AC drive correct;
+    /// pixels only latch their new state when consecutive writes see opposite
+    /// polarity, and a separate flag per path broke that parity.
+    vcom_state: bool,
 }
 
 impl<SPI, CS, const W: usize, const H: usize, const FB: usize> Ls0xxDisplay<SPI, CS, W, H, FB>
@@ -75,70 +74,65 @@ where
             cs,
             fb: [0; FB],
             shown: [0xFF; FB],
-            vcom: false,
+            vcom_state: false,
         }
     }
 
-    fn flags(&self, base: u8) -> u8 {
-        if self.vcom { base | BIT_VCOM } else { base }
+    /// Zephyr's `ls0xx_cmd`: OR the current VCOM polarity into the command
+    /// byte, then flip it. Every command goes through here so the polarity
+    /// alternates uniformly.
+    fn next_cmd(&mut self, base: u8) -> u8 {
+        let byte = if self.vcom_state { base | BIT_VCOM } else { base };
+        self.vcom_state = !self.vcom_state;
+        byte
     }
 
-    /// Push the framebuffer to the panel, one gate line per SPI transaction.
-    ///
-    /// This is what Zephyr's ls0xx driver does, and the panel is picky: a
-    /// single merged burst did not display at all on the nice!view. Keeping
-    /// each line as its own transaction costs one SPI interrupt per line but is
-    /// the known-good sequence.
-    async fn write_frame(&mut self) -> Result<(), SPI::Error> {
-        let per_line = bytes_per_line::<W>();
-        let mut line = [0u8; 1 + 32 + 1];
-
-        self.cs.set_high().ok();
-
-        let start = self.flags(BIT_WRITECMD);
-        self.vcom = !self.vcom;
-        self.spi.write(&[start]).await?;
-
-        for y in 0..H {
-            line[0] = (y + 1) as u8;
-            line[1..1 + per_line].copy_from_slice(&self.fb[y * per_line..(y + 1) * per_line]);
-            line[1 + per_line] = LINE_DUMMY;
-            self.spi.write(&line[..2 + per_line]).await?;
-        }
-
-        self.spi.write(&[self.flags(BIT_WRITECMD)]).await?;
-
-        self.cs.set_low().ok();
-        Ok(())
-    }
-
-    /// Hardware clear (Zephyr's `ls0xx_clear`): 2-byte command, `[CLEAR, 0]`.
-    ///
-    /// Every command byte Zephyr sends carries the VCOM polarity and flips it
-    /// (its `ls0xx_cmd` does `buf[0] |= vcom_state`, then toggles). Sending a
-    /// bare 0x04 left the panel's VCOM tracking and clear out of sync, so the
-    /// previous image stayed visible underneath.
+    /// Zephyr `ls0xx_clear`: `[0x04 | vcom, 0x00]`.
     async fn clear_panel(&mut self) -> Result<(), SPI::Error> {
-        let cmd = self.flags(BIT_CLEAR);
-        self.vcom = !self.vcom;
+        let cmd = self.next_cmd(BIT_CLEAR);
         self.cs.set_high().ok();
         let result = self.spi.write(&[cmd, 0x00]).await;
         self.cs.set_low().ok();
         result
     }
 
-    /// Flip VCOM with a bare command. Call this on a ~33ms ticker so the panel
-    /// keeps its contrast while the screen is not being redrawn.
-    ///
-    pub async fn vcom_tick(&mut self) -> Result<(), SPI::Error> {
-        let cmd = self.flags(BIT_VCOM);
-        self.vcom = !self.vcom;
+    /// Zephyr `ls0xx_update_display`: start command, one buffer per gate line
+    /// `[line, pixels, dummy]`, then a trailing command that latches the last
+    /// line. Commands carry VCOM, the per-line buffers do not.
+    async fn write_frame(&mut self) -> Result<(), SPI::Error> {
+        let per_line = bytes_per_line::<W>();
+        let mut line = [0u8; 1 + 32 + 1];
+
         self.cs.set_high().ok();
-        let result = self.spi.write(&[cmd]).await;
+
+        let start = self.next_cmd(BIT_WRITECMD);
+        self.spi.write(&[start]).await?;
+
+        for y in 0..H {
+            line[0] = (y + 1) as u8; // gate address is 1-based
+            line[1..1 + per_line].copy_from_slice(&self.fb[y * per_line..(y + 1) * per_line]);
+            line[1 + per_line] = LINE_DUMMY;
+            self.spi.write(&line[..2 + per_line]).await?;
+        }
+
+        // Trailing command that latches the last line, carrying VCOM like
+        // Zephyr's second `ls0xx_cmd` call.
+        let end = self.next_cmd(BIT_WRITECMD);
+        self.spi.write(&[end]).await?;
+
+        self.cs.set_low().ok();
+        Ok(())
+    }
+
+    /// Zephyr's idle VCOM ping: `[0x00 | vcom, 0x00]`, flipping the shared
+    /// polarity. Send it every ~33 ms; without it the image fades.
+    pub async fn vcom_tick(&mut self) -> Result<(), SPI::Error> {
+        let cmd = self.next_cmd(0x00);
+        self.cs.set_high().ok();
+        let result = self.spi.write(&[cmd, 0x00]).await;
         self.cs.set_low().ok();
         result
     }
-
 }
 
 impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions
@@ -186,12 +180,17 @@ where
     async fn init(&mut self) {
         // The panel keeps its last image across MCU resets (it is memory LCD).
         // Without this the previous firmware's content stays on screen.
-        for _ in 0..2 {
-            let _ = self.clear_panel().await;
+        let _ = self.clear_panel().await;
+        embassy_time::Timer::after_millis(10).await;
+
+        // Zap the previous firmware's image. The hardware CLEAR sets every
+        // pixel white; the extra blank frames then drive the pixels again so a
+        // stale polarized state cannot survive.
+        self.fb.fill(0);
+        for _ in 0..3 {
+            let _ = self.write_frame().await;
             embassy_time::Timer::after_millis(5).await;
         }
-        self.fb.fill(0);
-        let _ = self.write_frame().await;
         self.shown.copy_from_slice(&self.fb);
     }
 

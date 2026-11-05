@@ -88,7 +88,7 @@ where
     /// Zephyr `ls0xx_update_display`: start command, one buffer per gate line
     /// `[line, pixels, dummy]`, then a trailing command that latches the last
     /// line. Commands carry VCOM, the per-line buffers do not.
-    async fn write_frame(&mut self) -> Result<(), SPI::Error> {
+    async fn write_frame(&mut self, full: bool) -> Result<(), SPI::Error> {
         let per_line = bytes_per_line::<W>();
         let mut line = [0u8; 1 + 32 + 1];
 
@@ -112,12 +112,24 @@ where
         self.spi.write(&[start]).await?;
 
         for y in 0..H {
-            line[0] = (y + 1) as u8; // gate address is 1-based
             let src = &self.fb[y * per_line..(y + 1) * per_line];
+            // A gate line is sent only when it has content. Each line packet
+            // carries its own address, so an arbitrary subset may be written;
+            // skipping all-white lines avoids re-writing (and re-driving) the
+            // blank part of the panel every frame, which is what made the
+            // whole screen flicker.
+            let mut has_content = false;
             for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
                 // Constant on every frame: white background / black content.
                 *dst = !b;
+                if *dst != 0xFF {
+                    has_content = true;
+                }
             }
+            if !has_content && !full {
+                continue;
+            }
+            line[0] = (y + 1) as u8; // gate address is 1-based
             line[1 + per_line] = LINE_DUMMY;
             self.spi.write(&line[..2 + per_line]).await?;
         }
@@ -186,7 +198,7 @@ where
 
         self.fb.fill(0);
         for _ in 0..3 {
-            let _ = self.write_frame().await;
+            let _ = self.write_frame(true).await;
             embassy_time::Timer::after_millis(5).await;
         }
         self.shown.copy_from_slice(&self.fb);
@@ -196,18 +208,15 @@ where
         // Only touch the panel when the rendered image actually differs from
         // what is already on it (see `shown`).
         if self.fb != self.shown {
-            let _ = self.write_frame().await;
+            let _ = self.write_frame(true).await;
             self.shown.copy_from_slice(&self.fb);
         }
     }
 
     async fn tick(&mut self) {
-        // A memory LCD only holds its image while it keeps being driven with
-        // alternating VCOM. A bare VCOM ping (no pixel data) shimmered, and
-        // repainting every 33ms starved the BLE stack. So repaint the whole
-        // frame on a slow timer (set via with_vcom_interval) - frequent enough
-        // to hold contrast, cheap enough not to disturb the radio.
-        let _ = self.write_frame().await;
-        self.shown.copy_from_slice(&self.fb);
+        // Keep the AC drive going without touching the blank area: only the
+        // gate lines that carry content are re-sent. Re-driving every line
+        // repeatedly is what made the whole screen flicker.
+        let _ = self.write_frame(false).await;
     }
 }

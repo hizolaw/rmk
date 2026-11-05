@@ -94,33 +94,21 @@ where
 
         self.cs.set_high().ok();
 
-        // This frame's VCOM polarity, flipped once per frame so consecutive
-        // frames alternate.
-        let vcom = self.vcom_state;
-        self.vcom_state = !vcom;
-
-        // A Sharp memory LCD interprets pixel data inverted while VCOM is set.
-        // So to keep the same visible image across the AC drive, the data must
-        // be inverted together with VCOM. Sending un-inverted data with a
-        // flipped VCOM made the whole screen alternate white/black, and never
-        // flipping VCOM (as `memory-lcd-spi` does) leaves the panel with DC
-        // bias, which is what makes the old image stick.
-        let invert = vcom;
-
-        let start = if vcom { BIT_WRITECMD | BIT_VCOM } else { BIT_WRITECMD };
-        self.spi.write(&[start]).await?;
+        // Fixed VCOM polarity (no per-frame flip, so the image never flashes)
+        // and the pixel data inverted, so the panel shows white background
+        // with black content instead of black background with white content.
+        self.spi.write(&[BIT_WRITECMD]).await?;
 
         for y in 0..H {
             line[0] = (y + 1) as u8; // gate address is 1-based
             let src = &self.fb[y * per_line..(y + 1) * per_line];
             for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
-                *dst = if invert { !b } else { b };
+                *dst = !b; // invert: white bg / black text
             }
             line[1 + per_line] = LINE_DUMMY;
             self.spi.write(&line[..2 + per_line]).await?;
         }
 
-        // Latch the last line; no VCOM, so this frame flips polarity once.
         self.spi.write(&[BIT_WRITECMD]).await?;
 
         self.cs.set_low().ok();
@@ -178,31 +166,15 @@ where
     CS: OutputPin,
 {
     async fn init(&mut self) {
-        // A memory LCD holds the previous firmware's image across MCU resets,
-        // and long DC-biased driving leaves "image sticking" (ions piled up
-        // near the electrodes) that fades the old picture through the new one.
-        //
-        // The hardware CLEAR forces every pixel white. Then drive a few
-        // full-white and full-black frames: write_frame flips VCOM once per
-        // frame, so alternating white/black frames push every pixel through
-        // both states repeatedly, which exercises the sticking away. Only then
-        // paint the real content.
+        // Wipe whatever the previous firmware left, then paint an empty frame.
         let _ = self.clear_panel().await;
         embassy_time::Timer::after_millis(10).await;
 
+        self.fb.fill(0);
         for _ in 0..3 {
-            self.fb.fill(0xFF); // all white
-            let _ = self.write_frame().await;
-            embassy_time::Timer::after_millis(5).await;
-
-            self.fb.fill(0x00); // all black
             let _ = self.write_frame().await;
             embassy_time::Timer::after_millis(5).await;
         }
-
-        // Blank for the first real paint; the renderer decides the content.
-        self.fb.fill(0);
-        let _ = self.write_frame().await;
         self.shown.copy_from_slice(&self.fb);
     }
 

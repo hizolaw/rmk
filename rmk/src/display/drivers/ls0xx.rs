@@ -205,18 +205,23 @@ where
     }
 
     async fn flush(&mut self) {
-        // Only touch the panel when the rendered image actually differs from
-        // what is already on it (see `shown`).
+        // Only touch the panel when the rendered image actually differs.
         if self.fb != self.shown {
+            // Write the same image twice with opposite VCOM polarity. A memory
+            // LCD pixel only latches reliably when it is driven with both
+            // polarities; doing it back to back here gives the AC cycle
+            // up front. After that the bistable panel keeps the image with no
+            // further writes, so nothing flickers while idle.
+            let _ = self.write_frame(true).await;
             let _ = self.write_frame(true).await;
             self.shown.copy_from_slice(&self.fb);
         }
     }
 
     async fn tick(&mut self) {
-        // Keep the AC drive going without touching the blank area: only the
-        // gate lines that carry content are re-sent. Re-driving every line
-        // repeatedly is what made the whole screen flicker.
-        let _ = self.write_frame(false).await;
+        // Deliberately empty. A Sharp memory LCD is bistable: once written, a
+        // pixel holds its state with no refresh. Periodically re-driving it
+        // only makes the panel flicker, so refresh happens in flush() when the
+        // content actually changes, and never otherwise.
     }
 }

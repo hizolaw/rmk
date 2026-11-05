@@ -29,6 +29,11 @@ use crate::display::DisplayDriver;
 const BIT_WRITECMD: u8 = 0x01;
 const BIT_VCOM: u8 = 0x02;
 
+/// Bytes per gate line: one bit per pixel, `W` is a multiple of 8.
+const fn bytes_per_line<const W: usize>() -> usize {
+    W >> 3
+}
+
 /// A Sharp memory LCD over an async SPI bus.
 ///
 /// `W`/`H` are the panel resolution in pixels; the framebuffer is `W * H / 8`
@@ -55,11 +60,6 @@ where
         }
     }
 
-    fn bytes_per_line() -> usize {
-        // W is always a multiple of 8 for these panels.
-        W >> 3
-    }
-
     /// Command/flags byte carrying the current VCOM polarity.
     fn flags(&self, base: u8) -> u8 {
         if self.vcom { base | BIT_VCOM } else { base }
@@ -67,9 +67,8 @@ where
 
     /// Send the whole framebuffer to the panel, flipping VCOM for this frame.
     async fn write_frame(&mut self) -> Result<(), SPI::Error> {
-        let per_line = Self::bytes_per_line();
+        let per_line = bytes_per_line::<W>();
         // One gate line: 1 line-number byte + pixels + 1 dummy byte.
-        let per_line = Self::bytes_per_line();
         let mut line = [0u8; 1 + 32 + 1];
 
         self.cs.set_high().ok();
@@ -113,7 +112,7 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget for Ls
                 continue;
             }
             let (x, y) = (pt.x as usize, pt.y as usize);
-            let index = y * Self::bytes_per_line() + x / 8;
+            let index = y * bytes_per_line::<W>() + x / 8;
             let mask = 0x80 >> (x % 8);
             match color {
                 BinaryColor::On => self.fb[index] |= mask,

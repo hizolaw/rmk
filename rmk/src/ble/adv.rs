@@ -22,6 +22,11 @@ pub(crate) enum Adv<'a> {
     Directed(Address),
     /// Any BLE host, which finds us as a standard HID keyboard.
     Host { name: &'a str },
+    /// A host we already have a bond with, on a paired profile. Advertising is
+    /// restricted to `addr` via the controller's filter accept list, so a
+    /// different host in range cannot grab this profile and then fail
+    /// encryption (upstream issue #1131). The payload is the normal HID one.
+    BondedHost { name: &'a str, addr: Address },
     /// The split central that owns peripheral `id`.
     SplitPeripheral { id: u8 },
     /// An RMK dongle whose pairing window is open.
@@ -33,7 +38,7 @@ impl Adv<'_> {
     fn build<'b>(&self, buf: &'b mut [u8; 31]) -> Result<Advertisement<'b>, Error> {
         let adv_data: &[AdStructure] = match *self {
             Self::Directed(peer) => return Ok(Advertisement::ConnectableNonscannableDirected { peer }),
-            Self::Host { name } => &[
+            Self::Host { name } | Self::BondedHost { name, .. } => &[
                 AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
                 AdStructure::CompleteServiceUuids16(&[BATTERY.to_le_bytes(), HUMAN_INTERFACE_DEVICE.to_le_bytes()]),
                 AdStructure::CompleteLocalName(name.as_bytes()),
@@ -101,8 +106,15 @@ impl Adv<'_> {
     /// the host so discovery and reconnection are quick.
     fn params(&self) -> AdvertisementParameters {
         let interval = match self {
-            Self::Host { .. } => Duration::from_millis(30),
+            Self::Host { .. } | Self::BondedHost { .. } => Duration::from_millis(30),
             _ => Duration::from_millis(50),
+        };
+        // Only the bonded host may connect to a paired profile; an open
+        // advertisement would let any host in range take it and then fail
+        // encryption, which showed up as a connect/disconnect loop.
+        let filter_policy = match self {
+            Self::BondedHost { .. } => AdvFilterPolicy::FilterConnAndScan,
+            _ => AdvFilterPolicy::Unfiltered,
         };
         AdvertisementParameters {
             primary_phy: PhyKind::Le1M,
@@ -110,7 +122,17 @@ impl Adv<'_> {
             tx_power: TxPower::Plus8dBm,
             interval_min: interval,
             interval_max: interval,
+            filter_policy,
             ..Default::default()
+        }
+    }
+
+    /// The bonded peer whose address must go in the controller's accept list,
+    /// or `None` for advertisements that stay open to any peer.
+    pub(crate) fn bonded_peer(&self) -> Option<Address> {
+        match self {
+            Self::BondedHost { addr, .. } => Some(*addr),
+            _ => None,
         }
     }
 }
@@ -123,6 +145,13 @@ pub(crate) async fn advertise<'a, 'b, C: Controller, const ATT: usize, const CON
     adv: Adv<'_>,
     timeout: Duration,
 ) -> Result<GattConnection<'a, 'b, DefaultPacketPool>, BleHostError<C::Error>> {
+    // Restrict connections to the bonded peer when there is one. The accept
+    // list must be (re)programmed before each advertisement starts.
+    match adv.bonded_peer() {
+        Some(addr) => peripheral.set_filter_accept_list(&[addr]).await?,
+        None => peripheral.set_filter_accept_list(&[]).await?,
+    }
+
     let mut buf = [0; 31];
     let advertiser = peripheral.advertise(&adv.params(), adv.build(&mut buf)?).await?;
     let conn = with_timeout(timeout, advertiser.accept())

@@ -113,9 +113,16 @@ where
     }
 
     /// Hardware clear (Zephyr's `ls0xx_clear`): 2-byte command, `[CLEAR, 0]`.
+    ///
+    /// Every command byte Zephyr sends carries the VCOM polarity and flips it
+    /// (its `ls0xx_cmd` does `buf[0] |= vcom_state`, then toggles). Sending a
+    /// bare 0x04 left the panel's VCOM tracking and clear out of sync, so the
+    /// previous image stayed visible underneath.
     async fn clear_panel(&mut self) -> Result<(), SPI::Error> {
+        let cmd = self.flags(BIT_CLEAR);
+        self.vcom = !self.vcom;
         self.cs.set_high().ok();
-        let result = self.spi.write(&[BIT_CLEAR, 0x00]).await;
+        let result = self.spi.write(&[cmd, 0x00]).await;
         self.cs.set_low().ok();
         result
     }
@@ -179,8 +186,10 @@ where
     async fn init(&mut self) {
         // The panel keeps its last image across MCU resets (it is memory LCD).
         // Without this the previous firmware's content stays on screen.
-        let _ = self.clear_panel().await;
-        embassy_time::Timer::after_millis(10).await;
+        for _ in 0..2 {
+            let _ = self.clear_panel().await;
+            embassy_time::Timer::after_millis(5).await;
+        }
         self.fb.fill(0);
         let _ = self.write_frame().await;
         self.shown.copy_from_slice(&self.fb);

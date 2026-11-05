@@ -121,9 +121,9 @@ fn expand_spi_init(chip_series: &ChipSeries, spi: &SpiConfig) -> TokenStream {
                     let mut cfg = Config::default();
                     cfg.frequency = Frequency::M1;
                     cfg.mode = MODE_0;
-                    // Sharp LS0xx expects LSB-first bytes (Zephyr uses
-                    // SPI_TRANSFER_LSB); the driver default is MSB-first, which
-                    // makes the panel show nothing useful.
+                    // Sharp LS0xx addresses line numbers LSB-first (Zephyr sets
+                    // SPI_TRANSFER_LSB). The driver default is MSB-first, which
+                    // reverses the line-address bits and skews the image.
                     cfg.bit_order = BitOrder::LsbFirst;
                     Spim::new(p.#instance, Irqs, p.#sck, p.#miso, p.#mosi, cfg)
                 };

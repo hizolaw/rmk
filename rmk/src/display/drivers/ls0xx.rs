@@ -35,6 +35,7 @@ use crate::display::DisplayDriver;
 // LS0xx command bits, from Zephyr's ls0xx driver.
 const BIT_WRITECMD: u8 = 0x01;
 const BIT_VCOM: u8 = 0x02;
+const BIT_CLEAR: u8 = 0x04;
 
 /// Trailing byte after each gate line's pixels. The first working version sent
 /// 0x00 here and the panel displayed content, so keep that rather than Zephyr's
@@ -111,6 +112,14 @@ where
         Ok(())
     }
 
+    /// Hardware clear (Zephyr's `ls0xx_clear`): 2-byte command, `[CLEAR, 0]`.
+    async fn clear_panel(&mut self) -> Result<(), SPI::Error> {
+        self.cs.set_high().ok();
+        let result = self.spi.write(&[BIT_CLEAR, 0x00]).await;
+        self.cs.set_low().ok();
+        result
+    }
+
     /// Flip VCOM with a bare command. Call this on a ~33ms ticker so the panel
     /// keeps its contrast while the screen is not being redrawn.
     ///
@@ -149,7 +158,9 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget
             }
             let (x, y) = (pt.x as usize, pt.y as usize);
             let index = y * bytes_per_line::<W>() + x / 8;
-            let mask = 0x80 >> (x % 8);
+            // Byte bits are filled MSB-in-value; the bus is LSB-first (see
+            // expand_spi_init), so this byte reverses to keep pixel order.
+            let mask = 0x01 << (x % 8);
             match color {
                 BinaryColor::On => self.fb[index] |= mask,
                 BinaryColor::Off => self.fb[index] &= !mask,
@@ -166,6 +177,10 @@ where
     CS: OutputPin,
 {
     async fn init(&mut self) {
+        // The panel keeps its last image across MCU resets (it is memory LCD).
+        // Without this the previous firmware's content stays on screen.
+        let _ = self.clear_panel().await;
+        embassy_time::Timer::after_millis(10).await;
         self.fb.fill(0);
         let _ = self.write_frame().await;
         self.shown.copy_from_slice(&self.fb);

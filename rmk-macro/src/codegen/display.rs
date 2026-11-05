@@ -297,7 +297,7 @@ fn expand_display_processor_init(config: &DisplayConfig) -> TokenStream {
     let render_interval = if matches!(config.driver, DisplayDriver::Ls0xx) {
         quote! {}
     } else {
-        render_interval
+        render_interval.unwrap_or_default()
     };
 
     quote! {

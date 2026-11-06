@@ -272,8 +272,8 @@ impl GemRenderer {
     ) {
         // Layer name box.
         let box_h = 13;
-        let box = Rectangle::new(Point::new(1, top + 2), Size::new((w - 2) as u32, box_h as u32));
-        box.into_styled(STROKE).draw(display).ok();
+        let layer_box = Rectangle::new(Point::new(1, top + 2), Size::new((w - 2) as u32, box_h as u32));
+        layer_box.into_styled(STROKE).draw(display).ok();
 
         let mut lyr: heapless::String<10> = heapless::String::new();
         write!(lyr, "L{}", ctx.layer).ok();

@@ -201,11 +201,16 @@ fn expand_display_driver_init(config: &DisplayConfig) -> TokenStream {
     if let DisplayDriver::Ls0xx = config.driver {
         let (w, h) = parse_ls0xx_size(&config.size);
         let fb = w * h / 8;
+        let rotation = config.rotation;
+        if !matches!(rotation, 0 | 90 | 180 | 270) {
+            panic!("Unsupported LS0xx rotation '{}'. Supported: 0, 90, 180, 270", rotation);
+        }
         return quote! {
             let display = ::rmk::display::drivers::ls0xx::Ls0xxDisplay::<_, _, #w, #h, #fb>::new(
                 display_spi,
                 ::embassy_nrf::gpio::Output::new(display_cs_pin, ::embassy_nrf::gpio::Level::Low, ::embassy_nrf::gpio::OutputDrive::Standard),
-            );
+            )
+            .with_rotation(#rotation);
         };
     }
 

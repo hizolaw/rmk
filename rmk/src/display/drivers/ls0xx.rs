@@ -50,6 +50,9 @@ pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize
     /// pixels only latch their new state when consecutive writes see opposite
     /// polarity, and a separate flag per path broke that parity.
     vcom_state: bool,
+    /// Display rotation in degrees: 0, 90, 180, 270. The panel is physically
+    /// W x H; for 90/270 the logical drawing surface is H x W (portrait).
+    rotation: u16,
 }
 
 impl<SPI, CS, const W: usize, const H: usize, const FB: usize> Ls0xxDisplay<SPI, CS, W, H, FB>
@@ -64,6 +67,28 @@ where
             fb: [0; FB],
             shown: [0xFF; FB],
             vcom_state: false,
+            rotation: 0,
+        }
+    }
+
+    /// Set the display rotation (0, 90, 180, 270).
+    pub fn with_rotation(mut self, rotation: u16) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// Whether the logical surface is portrait (width/height swapped).
+    fn swapped(&self) -> bool {
+        matches!(self.rotation, 90 | 270)
+    }
+
+    /// Map a logical pixel to physical panel coordinates.
+    fn map(&self, x: usize, y: usize) -> (usize, usize) {
+        match self.rotation {
+            90 => (y, H - 1 - x),
+            180 => (W - 1 - x, H - 1 - y),
+            270 => (W - 1 - y, x),
+            _ => (x, y),
         }
     }
 
@@ -153,7 +178,11 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions
     for Ls0xxDisplay<SPI, CS, W, H, FB>
 {
     fn size(&self) -> Size {
-        Size::new(W as u32, H as u32)
+        if self.swapped() {
+            Size::new(H as u32, W as u32)
+        } else {
+            Size::new(W as u32, H as u32)
+        }
     }
 }
 
@@ -167,11 +196,12 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget
     where
         I: IntoIterator<Item = Pixel<BinaryColor>>,
     {
+        let (lw, lh) = if self.swapped() { (H as i32, W as i32) } else { (W as i32, H as i32) };
         for Pixel(pt, color) in pixels {
-            if pt.x < 0 || pt.y < 0 || pt.x >= W as i32 || pt.y >= H as i32 {
+            if pt.x < 0 || pt.y < 0 || pt.x >= lw || pt.y >= lh {
                 continue;
             }
-            let (x, y) = (pt.x as usize, pt.y as usize);
+            let (x, y) = self.map(pt.x as usize, pt.y as usize);
             let index = y * bytes_per_line::<W>() + x / 8;
             // Byte bits are filled MSB-in-value; the bus is LSB-first (see
             // expand_spi_init), so this byte reverses to keep pixel order.

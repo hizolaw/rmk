@@ -160,15 +160,22 @@ impl GemRenderer {
         w: i32,
         header_h: i32,
     ) {
-        #[cfg(feature = "_ble")]
-        let (level, charging) = match &ctx.battery.0 {
-            BatteryStatus::Available { charge_state, level } => {
-                (*level, matches!(charge_state, ChargeState::Charging))
+        let (level, charging): (Option<u8>, bool) = {
+            #[cfg(feature = "_ble")]
+            {
+                match &ctx.battery.0 {
+                    BatteryStatus::Available { charge_state, level } => {
+                        (*level, matches!(charge_state, ChargeState::Charging))
+                    }
+                    BatteryStatus::Unavailable => (None, false),
+                }
             }
-            BatteryStatus::Unavailable => (None, false),
+            #[cfg(not(feature = "_ble"))]
+            {
+                let _ = ctx;
+                (None, false)
+            }
         };
-        #[cfg(not(feature = "_ble"))]
-        let (level, charging): (Option<u8>, bool) = (None, false);
 
         let bw = 22;
         let bh = 9;

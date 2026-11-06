@@ -1,29 +1,27 @@
-//! A "gem"-style status renderer, inspired by the popular
+//! A "gem"-style status renderer modelled on the popular
 //! [`nice-view-gem`](https://github.com/M165437/nice-view-gem) ZMK shield.
 //!
-//! It is written for the nice!view in **portrait** (a 68x160 logical surface,
-//! i.e. `rotation = 90`): the panel is physically 160x68, turned on its side.
-//! Layout, top to bottom:
+//! Targets the nice!view in **portrait**: a 68x160 logical surface (the panel
+//! is physically 160x68, rotated). Layout, top to bottom:
 //!
 //! ```text
-//!  ┌──────────┐
-//!  │ SIG  ███ │  connection / battery
-//!  ├──────────┤
-//!  │  BAT 78% │
-//!  │          │
-//!  │   WPM    │
-//!  │   62     │
-//!  │  ▁▂▃▅▇   │  sparkline
-//!  ├──────────┤
-//!  │ PROFILE  │
-//!  │   2      │
-//!  │ QWERTY   │  layer
-//!  └──────────┘
+//!  ┌────────────┐
+//!  │ SIG ▁▃▅█   │  signal bars + battery
+//!  │  ████ 78%  │
+//!  ├────────────┤
+//!  │    WPM     │
+//!  │     62     │
+//!  │  ▂▃▅▆▇█▆▅  │  history chart
+//!  ├────────────┤
+//!  │┌──────────┐│
+//!  ││  QWERTY  ││  layer name
+//!  │└──────────┘│
+//!  │  ● ○ ○ ○   │  profile dots
+//!  └────────────┘
 //! ```
 //!
-//! Everything is drawn with `embedded-graphics` primitives, so it works with
-//! any monochrome `DisplayDriver`; the layout keys off the surface size rather
-//! than hard-coded offsets.
+//! Drawn with `embedded-graphics` primitives and laid out from the surface
+//! size, so it adapts instead of using hard-coded pixel offsets.
 
 use core::fmt::Write as _;
 
@@ -37,15 +35,19 @@ use embedded_graphics::text::Text;
 use crate::display::{DisplayRenderer, RenderContext};
 #[cfg(feature = "_ble")]
 use rmk_types::battery::{BatteryStatus, ChargeState};
+#[cfg(feature = "_ble")]
+use rmk_types::ble::BleState;
 
 const FG: MonoTextStyle<'_, BinaryColor> = MonoTextStyle::new(&FONT_5X8, BinaryColor::On);
 const STROKE: PrimitiveStyle<BinaryColor> = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
 const FILL: PrimitiveStyle<BinaryColor> = PrimitiveStyle::with_fill(BinaryColor::On);
 
-/// WPM history used by the sparkline. Sized small to keep RAM low.
+/// WPM history length used by the bar chart.
 const HISTORY: usize = 12;
+/// Number of BLE profiles drawn as dots at the bottom.
+const PROFILES: u8 = 4;
 
-/// Gem-style renderer with a WPM sparkline and battery/connection header.
+/// Gem-style status renderer for a portrait memory LCD.
 #[derive(Default)]
 pub struct GemRenderer {
     wpm_history: [u8; HISTORY],
@@ -82,58 +84,22 @@ impl DisplayRenderer<BinaryColor> for GemRenderer {
 
         self.push_wpm(ctx.wpm);
 
-        // Split vertically into three bands.
-        let top_h = 20;
-        let mid_h = (h - top_h) / 2;
-        let sep1 = top_h;
-        let sep2 = top_h + mid_h;
+        // Bands: header (signal+battery), body (WPM), footer (layer+profiles).
+        let header_h = 22;
+        let footer_h = 32;
+        let body_top = header_h;
+        let body_bottom = h - footer_h;
+        let footer_top = body_bottom;
 
-        // --- Top: signal label + battery ---
-        Text::new("SIG", Point::new(2, 10), FG).draw(display).ok();
-        self.draw_battery(ctx, display, w, top_h);
+        self.draw_header(ctx, display, w, header_h);
+        self.draw_wpm(ctx, display, w, body_top, body_bottom);
+        self.draw_footer(ctx, display, w, h, footer_top);
 
-        // --- Middle: WPM value + sparkline ---
-        let mut buf: heapless::String<8> = heapless::String::new();
-        write!(buf, "{}", ctx.wpm).ok();
-        // Right-align the number.
-        let num_x = (w - buf.len() as i32 * 5).max(2);
-        Text::new(&buf, Point::new(num_x, sep1 + 16), FG).draw(display).ok();
-        Text::new("WPM", Point::new(2, sep1 + 16), FG).draw(display).ok();
-        self.draw_sparkline(display, w, sep1 + 20, sep2);
-
-        // --- Bottom: profile + layer ---
-        #[cfg(feature = "_ble")]
-        {
-            let mut p: heapless::String<8> = heapless::String::new();
-            write!(p, "P{}", ctx.ble_status.profile).ok();
-            Text::new(&p, Point::new(2, sep2 + 12), FG).draw(display).ok();
-            let (dot_x, dot_y) = (w - 8, sep2 + 7);
-            if matches!(
-                ctx.ble_status.state,
-                rmk_types::ble::BleState::Connected
-            ) {
-                Rectangle::new(Point::new(dot_x, dot_y), Size::new(5, 5))
-                    .into_styled(FILL)
-                    .draw(display)
-                    .ok();
-            } else {
-                Rectangle::new(Point::new(dot_x, dot_y), Size::new(5, 5))
-                    .into_styled(STROKE)
-                    .draw(display)
-                    .ok();
-            }
-        }
-
-        let mut lyr: heapless::String<12> = heapless::String::new();
-        write!(lyr, "L{}", ctx.layer).ok();
-        Text::new(&lyr, Point::new(2, h - 4), FG).draw(display).ok();
-
-        // Separators.
-        Line::new(Point::new(0, sep1), Point::new(w - 1, sep1))
+        Line::new(Point::new(0, header_h), Point::new(w - 1, header_h))
             .into_styled(STROKE)
             .draw(display)
             .ok();
-        Line::new(Point::new(0, sep2), Point::new(w - 1, sep2))
+        Line::new(Point::new(0, footer_top), Point::new(w - 1, footer_top))
             .into_styled(STROKE)
             .draw(display)
             .ok();
@@ -141,33 +107,79 @@ impl DisplayRenderer<BinaryColor> for GemRenderer {
 }
 
 impl GemRenderer {
-    #[cfg(feature = "_ble")]
+    /// "SIG" plus connection bars on the left, battery icon + percent on the right.
+    fn draw_header<D: DrawTarget<Color = BinaryColor>>(
+        &self,
+        ctx: &RenderContext,
+        display: &mut D,
+        w: i32,
+        header_h: i32,
+    ) {
+        Text::new("SIG", Point::new(1, 9), FG).draw(display).ok();
+        self.draw_signal(ctx, display, header_h);
+
+        self.draw_battery(ctx, display, w, header_h);
+    }
+
+    /// Four ascending bars; the number of filled bars reflects the link state.
+    fn draw_signal<D: DrawTarget<Color = BinaryColor>>(
+        &self,
+        ctx: &RenderContext,
+        display: &mut D,
+        header_h: i32,
+    ) {
+        #[cfg(feature = "_ble")]
+        let bars: u8 = match ctx.ble_status.state {
+            BleState::Connected => 4,
+            BleState::Advertising => 2,
+            BleState::Inactive => 1,
+        };
+        #[cfg(not(feature = "_ble"))]
+        let bars: u8 = 0;
+
+        let _ = &ctx;
+        let base_y = header_h - 3;
+        for i in 0..4u8 {
+            let bh = 3 + i as i32 * 2;
+            let x = 26 + i as i32 * 4;
+            let rect = Rectangle::new(Point::new(x, base_y - bh), Size::new(3, bh as u32));
+            if i < bars {
+                rect.into_styled(FILL).draw(display).ok();
+            } else {
+                rect.into_styled(STROKE).draw(display).ok();
+            }
+        }
+    }
+
+    /// Battery outline with proportional fill, a nub, the percentage, and a
+    /// bolt when charging.
     fn draw_battery<D: DrawTarget<Color = BinaryColor>>(
         &self,
         ctx: &RenderContext,
         display: &mut D,
         w: i32,
-        top_h: i32,
+        header_h: i32,
     ) {
+        #[cfg(feature = "_ble")]
         let (level, charging) = match &ctx.battery.0 {
             BatteryStatus::Available { charge_state, level } => {
                 (*level, matches!(charge_state, ChargeState::Charging))
             }
             BatteryStatus::Unavailable => (None, false),
         };
+        #[cfg(not(feature = "_ble"))]
+        let (level, charging): (Option<u8>, bool) = (None, false);
 
-        // Battery icon: a small rectangle with a fill proportional to level.
-        let bw = 26;
-        let bh = 10;
-        let bx = w - bw - 4;
-        let by = (top_h - bh) / 2;
+        let bw = 22;
+        let bh = 9;
+        let bx = w - bw - 5;
+        let by = 2;
 
         Rectangle::new(Point::new(bx, by), Size::new(bw as u32, bh as u32))
             .into_styled(STROKE)
             .draw(display)
             .ok();
-        // Nub.
-        Rectangle::new(Point::new(bx + bw, by + 3), Size::new(2, 4))
+        Rectangle::new(Point::new(bx + bw, by + 3), Size::new(2, 3))
             .into_styled(FILL)
             .draw(display)
             .ok();
@@ -180,51 +192,109 @@ impl GemRenderer {
                     .draw(display)
                     .ok();
             }
+            let mut pct: heapless::String<5> = heapless::String::new();
+            write!(pct, "{}%", level).ok();
+            let tx = bx - pct.len() as i32 * 5 - 2;
+            Text::new(&pct, Point::new(tx.max(1), by + 8), FG).draw(display).ok();
         }
-        // A charging bolt: a short vertical bar when charging.
+
         if charging {
-            Rectangle::new(Point::new(bx + bw / 2 - 1, by + 2), Size::new(2, (bh - 4) as u32))
+            // Small bolt between the battery and its percentage.
+            let cx = bx + bw / 2;
+            Line::new(Point::new(cx, by + 2), Point::new(cx - 2, by + 5))
+                .into_styled(STROKE)
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx - 2, by + 5), Point::new(cx + 1, by + 5))
+                .into_styled(STROKE)
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx + 1, by + 5), Point::new(cx - 1, by + 8))
                 .into_styled(STROKE)
                 .draw(display)
                 .ok();
         }
     }
 
-    #[cfg(not(feature = "_ble"))]
-    fn draw_battery<D: DrawTarget<Color = BinaryColor>>(
+    /// "WPM", the current value, and a history bar chart.
+    fn draw_wpm<D: DrawTarget<Color = BinaryColor>>(
         &self,
-        _ctx: &RenderContext,
-        _display: &mut D,
-        _w: i32,
-        _top_h: i32,
-    ) {
-    }
-
-    fn draw_sparkline<D: DrawTarget<Color = BinaryColor>>(
-        &self,
+        ctx: &RenderContext,
         display: &mut D,
         w: i32,
         top: i32,
         bottom: i32,
     ) {
+        Text::new("WPM", Point::new(1, top + 10), FG).draw(display).ok();
+
+        let mut val: heapless::String<6> = heapless::String::new();
+        write!(val, "{}", ctx.wpm).ok();
+        let vx = (w - val.len() as i32 * 5 - 1).max(1);
+        Text::new(&val, Point::new(vx, top + 10), FG).draw(display).ok();
+
+        // Bar chart of recent WPM below the value.
+        let chart_top = top + 14;
+        let chart_bottom = bottom - 2;
+        let chart_h = (chart_bottom - chart_top).max(1);
         let max = self.history_iter().max().unwrap_or(1).max(1) as i32;
-        let n = self.hist_len;
-        if n < 2 {
-            return;
-        }
-        let height = (bottom - top - 3).max(1);
-        let step = ((w - 4) / (HISTORY as i32 - 1)).max(1);
-        let mut prev: Option<Point> = None;
-        for (i, v) in self.history_iter().enumerate() {
-            let x = 2 + i as i32 * step;
-            let y = bottom - 2 - (v as i32 * height / max);
-            let p = Point::new(x, y);
-            if let Some(q) = prev {
-                Line::new(q, p).into_styled(STROKE).draw(display).ok();
-            } else {
-                Rectangle::new(p, Size::new(2, 2)).into_styled(FILL).draw(display).ok();
+        let slot = (w - 2) / HISTORY as i32;
+        let bar_w = (slot - 1).max(1);
+        let start = (self.hist_pos + HISTORY - self.hist_len) % HISTORY;
+        for i in 0..self.hist_len {
+            let v = self.wpm_history[(start + i) % HISTORY] as i32;
+            let bh = (v * chart_h / max).max(0);
+            if bh == 0 {
+                continue;
             }
-            prev = Some(p);
+            let x = 1 + i as i32 * slot;
+            Rectangle::new(Point::new(x, chart_bottom - bh), Size::new(bar_w as u32, bh as u32))
+                .into_styled(FILL)
+                .draw(display)
+                .ok();
         }
+    }
+
+    /// Layer name in a rounded box, with profile dots underneath.
+    fn draw_footer<D: DrawTarget<Color = BinaryColor>>(
+        &self,
+        ctx: &RenderContext,
+        display: &mut D,
+        w: i32,
+        h: i32,
+        top: i32,
+    ) {
+        // Layer name box.
+        let box_h = 13;
+        let box = Rectangle::new(Point::new(1, top + 2), Size::new((w - 2) as u32, box_h as u32));
+        box.into_styled(STROKE).draw(display).ok();
+
+        let mut lyr: heapless::String<10> = heapless::String::new();
+        write!(lyr, "L{}", ctx.layer).ok();
+        let lx = (w - lyr.len() as i32 * 5) / 2;
+        Text::new(&lyr, Point::new(lx.max(1), top + 11), FG)
+            .draw(display)
+            .ok();
+
+        // Profile dots: PROFILES circles, the active one filled.
+        #[cfg(feature = "_ble")]
+        let active = ctx.ble_status.profile;
+        #[cfg(not(feature = "_ble"))]
+        let active = 0u8;
+
+        let dot = 5;
+        let gap = 3;
+        let total = PROFILES as i32 * dot + (PROFILES as i32 - 1) * gap;
+        let mut x = (w - total) / 2;
+        let y = top + box_h + 5;
+        for i in 0..PROFILES {
+            let r = Rectangle::new(Point::new(x, y), Size::new(dot as u32, dot as u32));
+            if i == active {
+                r.into_styled(FILL).draw(display).ok();
+            } else {
+                r.into_styled(STROKE).draw(display).ok();
+            }
+            x += dot + gap;
+        }
+        let _ = h;
     }
 }

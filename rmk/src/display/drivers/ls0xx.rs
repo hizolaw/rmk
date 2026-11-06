@@ -114,56 +114,44 @@ where
     /// Zephyr `ls0xx_update_display`: start command, one buffer per gate line
     /// `[line, pixels, dummy]`, then a trailing command that latches the last
     /// line. Commands carry VCOM, the per-line buffers do not.
+    /// Send only the gate lines whose content differs from `shown` (or every
+    /// line when `full` is set). `shown` is updated to match afterwards.
     async fn write_frame(&mut self, full: bool) -> Result<(), SPI::Error> {
         let per_line = bytes_per_line::<W>();
         let mut line = [0u8; 1 + 32 + 1];
 
         self.cs.set_high().ok();
 
-        // Alternate the VCOM bit every frame: this is the AC drive a Sharp
-        // memory LCD needs, and without it the contrast fades (washed out).
-        // The panel does NOT invert the data when VCOM changes - it simply
-        // latches the bits as sent - so the pixel data must be identical on
-        // every frame. Keeping the data constant while VCOM alternates gives a
-        // stable image with a proper AC field; flipping the data along with
-        // VCOM made the screen flash black/white.
-        //
-        // Pixel convention on the wire: 1 = white, 0 = black. `fb` has bit 1
-        // for "On" (drawn content), so `!b` renders white background with
-        // black content on every frame.
+        // VCOM alternates once per write pass; the pixel data never changes
+        // with it (the panel latches bits as sent), so the image stays put.
+        // Pixel convention on the wire: 1 = white, 0 = black; `!b` gives a
+        // white background with black content from the framebuffer.
         let vcom = self.vcom_state;
         self.vcom_state = !vcom;
-
         let start = if vcom { BIT_WRITECMD | BIT_VCOM } else { BIT_WRITECMD };
         self.spi.write(&[start]).await?;
 
         for y in 0..H {
             let src = &self.fb[y * per_line..(y + 1) * per_line];
-            // A gate line is sent only when it has content. Each line packet
-            // carries its own address, so an arbitrary subset may be written;
-            // skipping all-white lines avoids re-writing (and re-driving) the
-            // blank part of the panel every frame, which is what made the
-            // whole screen flicker.
-            let mut has_content = false;
-            for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
-                // Constant on every frame: white background / black content.
-                *dst = !b;
-                if *dst != 0xFF {
-                    has_content = true;
-                }
-            }
-            if !has_content && !full {
+            // Skip lines whose pixels did not change since they were last
+            // sent: re-driving unchanged lines is what made the screen flash
+            // on every update. A full pass (init) writes every line.
+            if !full && src == &self.shown[y * per_line..(y + 1) * per_line] {
                 continue;
+            }
+            for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
+                *dst = !b;
             }
             line[0] = (y + 1) as u8; // gate address is 1-based
             line[1 + per_line] = LINE_DUMMY;
             self.spi.write(&line[..2 + per_line]).await?;
         }
 
-        // Latch the last line; no VCOM here so the frame flips polarity once.
+        // Latch the last line; no VCOM here so a pass flips polarity once.
         self.spi.write(&[BIT_WRITECMD]).await?;
 
         self.cs.set_low().ok();
+        self.shown.copy_from_slice(&self.fb);
         Ok(())
     }
 
@@ -228,7 +216,9 @@ where
         embassy_time::Timer::after_millis(10).await;
 
         self.fb.fill(0);
+        self.shown.fill(0xFF);
         for _ in 0..3 {
+            self.shown.fill(0xFF);
             let _ = self.write_frame(true).await;
             embassy_time::Timer::after_millis(5).await;
         }
@@ -236,16 +226,10 @@ where
     }
 
     async fn flush(&mut self) {
-        // Only touch the panel when the rendered image actually differs.
+        // Only the changed gate lines are rewritten, so an update does not
+        // flash the whole panel.
         if self.fb != self.shown {
-            // Write the same image twice with opposite VCOM polarity. A memory
-            // LCD pixel only latches reliably when it is driven with both
-            // polarities; doing it back to back here gives the AC cycle
-            // up front. After that the bistable panel keeps the image with no
-            // further writes, so nothing flickers while idle.
-            let _ = self.write_frame(true).await;
-            let _ = self.write_frame(true).await;
-            self.shown.copy_from_slice(&self.fb);
+            let _ = self.write_frame(false).await;
         }
     }
 

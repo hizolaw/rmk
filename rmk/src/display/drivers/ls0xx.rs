@@ -34,6 +34,21 @@ const fn bytes_per_line<const W: usize>() -> usize {
     W >> 3
 }
 
+/// Whether a rotation swaps the logical width and height.
+const fn rotation_swaps(rotation: u16) -> bool {
+    matches!(rotation, 90 | 270)
+}
+
+/// Map a logical pixel to physical panel coordinates for a rotation.
+const fn rotate_point(x: usize, y: usize, rotation: u16, w: usize, h: usize) -> (usize, usize) {
+    match rotation {
+        90 => (y, h - 1 - x),
+        180 => (w - 1 - x, h - 1 - y),
+        270 => (w - 1 - y, x),
+        _ => (x, y),
+    }
+}
+
 /// A Sharp memory LCD over an async SPI bus.
 ///
 /// `W`/`H` are the panel resolution; `FB` is `W * H / 8` (the framebuffer
@@ -77,20 +92,6 @@ where
         self
     }
 
-    /// Whether the logical surface is portrait (width/height swapped).
-    fn swapped(&self) -> bool {
-        matches!(self.rotation, 90 | 270)
-    }
-
-    /// Map a logical pixel to physical panel coordinates.
-    fn map(&self, x: usize, y: usize) -> (usize, usize) {
-        match self.rotation {
-            90 => (y, H - 1 - x),
-            180 => (W - 1 - x, H - 1 - y),
-            270 => (W - 1 - y, x),
-            _ => (x, y),
-        }
-    }
 
     /// Zephyr's `ls0xx_cmd`: OR the current VCOM polarity into the command
     /// byte, then flip it. Every command goes through here so the polarity
@@ -178,7 +179,7 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions
     for Ls0xxDisplay<SPI, CS, W, H, FB>
 {
     fn size(&self) -> Size {
-        if self.swapped() {
+        if rotation_swaps(self.rotation) {
             Size::new(H as u32, W as u32)
         } else {
             Size::new(W as u32, H as u32)
@@ -196,12 +197,12 @@ impl<SPI, CS, const W: usize, const H: usize, const FB: usize> DrawTarget
     where
         I: IntoIterator<Item = Pixel<BinaryColor>>,
     {
-        let (lw, lh) = if self.swapped() { (H as i32, W as i32) } else { (W as i32, H as i32) };
+        let (lw, lh) = if rotation_swaps(self.rotation) { (H as i32, W as i32) } else { (W as i32, H as i32) };
         for Pixel(pt, color) in pixels {
             if pt.x < 0 || pt.y < 0 || pt.x >= lw || pt.y >= lh {
                 continue;
             }
-            let (x, y) = self.map(pt.x as usize, pt.y as usize);
+            let (x, y) = rotate_point(pt.x as usize, pt.y as usize, self.rotation, W, H);
             let index = y * bytes_per_line::<W>() + x / 8;
             // Byte bits are filled MSB-in-value; the bus is LSB-first (see
             // expand_spi_init), so this byte reverses to keep pixel order.

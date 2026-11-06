@@ -236,9 +236,12 @@ pub(crate) async fn run_peripheral_session<
 /// Default connection parameters for the central <-> peripheral connection.
 fn default_split_conn_params() -> RequestedConnParams {
     RequestedConnParams {
-        min_connection_interval: Duration::from_micros(7500),
-        max_connection_interval: Duration::from_micros(7500),
-        max_latency: 30, // 232.5ms, same as the awake subrate params
+        // 15ms instead of 7.5ms: halves the split link's radio wake-ups while
+        // staying far below anything noticeable. max_latency 30 lets the
+        // peripheral skip up to 30 events (~450ms) when there is no input.
+        min_connection_interval: Duration::from_millis(15),
+        max_connection_interval: Duration::from_millis(15),
+        max_latency: 30,
         supervision_timeout: Duration::from_secs(6),
         ..Default::default()
     }

@@ -766,8 +766,10 @@ pub(crate) async fn set_conn_params<
         // The first request is what Apple devices accept:
         // https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf
         (Duration::from_millis(15), 30, Duration::from_secs(6)),
-        // The second request is for best performance
-        (Duration::from_micros(7500), 60, Duration::from_secs(6)),
+        // The second request trades a little latency for much less radio
+        // wake-up time: a 30ms interval instead of 7.5ms roughly quarters the
+        // number of connection events the radio must service while typing.
+        (Duration::from_millis(30), 60, Duration::from_secs(6)),
     ];
 
     for (interval, max_latency, supervision_timeout) in requests {

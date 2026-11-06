@@ -42,34 +42,12 @@ const FG: MonoTextStyle<'_, BinaryColor> = MonoTextStyle::new(&FONT_5X8, BinaryC
 const STROKE: PrimitiveStyle<BinaryColor> = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
 const FILL: PrimitiveStyle<BinaryColor> = PrimitiveStyle::with_fill(BinaryColor::On);
 
-/// WPM history length used by the bar chart.
-const HISTORY: usize = 12;
 /// Number of BLE profiles drawn as dots at the bottom.
 const PROFILES: u8 = 4;
 
 /// Gem-style status renderer for a portrait memory LCD.
 #[derive(Default)]
-pub struct GemRenderer {
-    wpm_history: [u8; HISTORY],
-    hist_len: usize,
-    hist_pos: usize,
-}
-
-impl GemRenderer {
-    fn push_wpm(&mut self, wpm: u16) {
-        let v = wpm.min(u8::MAX as u16) as u8;
-        self.wpm_history[self.hist_pos] = v;
-        self.hist_pos = (self.hist_pos + 1) % HISTORY;
-        if self.hist_len < HISTORY {
-            self.hist_len += 1;
-        }
-    }
-
-    fn history_iter(&self) -> impl Iterator<Item = u8> + '_ {
-        let start = (self.hist_pos + HISTORY - self.hist_len) % HISTORY;
-        (0..self.hist_len).map(move |i| self.wpm_history[(start + i) % HISTORY])
-    }
-}
+pub struct GemRenderer;
 
 impl DisplayRenderer<BinaryColor> for GemRenderer {
     fn render<D: DrawTarget<Color = BinaryColor>>(&mut self, ctx: &RenderContext, display: &mut D) {
@@ -82,8 +60,6 @@ impl DisplayRenderer<BinaryColor> for GemRenderer {
             return;
         }
 
-        self.push_wpm(ctx.wpm);
-
         // Bands: header (signal+battery), body (WPM), footer (layer+profiles).
         let header_h = 22;
         let footer_h = 32;
@@ -92,7 +68,8 @@ impl DisplayRenderer<BinaryColor> for GemRenderer {
         let footer_top = body_bottom;
 
         self.draw_header(ctx, display, w, header_h);
-        self.draw_wpm(ctx, display, w, body_top, body_bottom);
+        let _ = body_bottom;
+        self.draw_wpm(ctx, display, w, body_top);
         self.draw_footer(ctx, display, w, h, footer_top);
 
         Line::new(Point::new(0, header_h), Point::new(w - 1, header_h))
@@ -230,7 +207,6 @@ impl GemRenderer {
         display: &mut D,
         w: i32,
         top: i32,
-        bottom: i32,
     ) {
         Text::new("WPM", Point::new(1, top + 10), FG).draw(display).ok();
 
@@ -239,29 +215,6 @@ impl GemRenderer {
         let vx = (w - val.len() as i32 * 5 - 1).max(1);
         Text::new(&val, Point::new(vx, top + 10), FG).draw(display).ok();
 
-        // Line graph of recent WPM below the value.
-        let chart_top = top + 14;
-        let chart_bottom = bottom - 2;
-        let chart_h = (chart_bottom - chart_top).max(1);
-        if self.hist_len < 2 {
-            return;
-        }
-        let max = self.history_iter().max().unwrap_or(1).max(1) as i32;
-        let slot = (w - 2) / (HISTORY as i32 - 1).max(1);
-        let start = (self.hist_pos + HISTORY - self.hist_len) % HISTORY;
-
-        let mut prev: Option<Point> = None;
-        for i in 0..self.hist_len {
-            let v = self.wpm_history[(start + i) % HISTORY] as i32;
-            let x = 1 + i as i32 * slot;
-            let y = chart_bottom - (v * chart_h / max);
-            let p = Point::new(x, y);
-            match prev {
-                Some(q) => Line::new(q, p).into_styled(STROKE).draw(display).ok(),
-                None => Rectangle::new(p, Size::new(2, 2)).into_styled(FILL).draw(display).ok(),
-            };
-            prev = Some(p);
-        }
     }
 
     /// Layer name in a rounded box, with profile dots underneath.

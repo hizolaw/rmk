@@ -114,45 +114,49 @@ where
     /// Zephyr `ls0xx_update_display`: start command, one buffer per gate line
     /// `[line, pixels, dummy]`, then a trailing command that latches the last
     /// line. Commands carry VCOM, the per-line buffers do not.
-    /// Send only the gate lines whose content differs from `shown` (or every
-    /// line when `full` is set). `shown` is updated to match afterwards.
-    async fn write_frame(&mut self, full: bool) -> Result<(), SPI::Error> {
+    /// Write the gate lines whose content differs from `shown`, using the
+    /// given VCOM polarity. The visible image is `data XOR vcom`, so on a
+    /// VCOM-set pass the data is inverted as well; that keeps the picture
+    /// identical while the pixels receive one AC polarity.
+    async fn write_pass(&mut self, vcom: bool, full: bool, base: &[u8; FB]) -> Result<(), SPI::Error> {
         let per_line = bytes_per_line::<W>();
         let mut line = [0u8; 1 + 32 + 1];
 
         self.cs.set_high().ok();
 
-        // VCOM alternates once per write pass; the pixel data never changes
-        // with it (the panel latches bits as sent), so the image stays put.
-        // Pixel convention on the wire: 1 = white, 0 = black; `!b` gives a
-        // white background with black content from the framebuffer.
-        let vcom = self.vcom_state;
-        self.vcom_state = !vcom;
         let start = if vcom { BIT_WRITECMD | BIT_VCOM } else { BIT_WRITECMD };
         self.spi.write(&[start]).await?;
 
         for y in 0..H {
             let src = &self.fb[y * per_line..(y + 1) * per_line];
-            // Skip lines whose pixels did not change since they were last
-            // sent: re-driving unchanged lines is what made the screen flash
-            // on every update. A full pass (init) writes every line.
-            if !full && src == &self.shown[y * per_line..(y + 1) * per_line] {
+            if !full && src == &base[y * per_line..(y + 1) * per_line] {
                 continue;
             }
             for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
-                *dst = !b;
+                // white background / black content = !b; flip again on a
+                // VCOM-set pass so the visible result is unchanged.
+                *dst = if vcom { b } else { !b };
             }
-            line[0] = (y + 1) as u8; // gate address is 1-based
+            line[0] = (y + 1) as u8;
             line[1 + per_line] = LINE_DUMMY;
             self.spi.write(&line[..2 + per_line]).await?;
         }
 
-        // Latch the last line; no VCOM here so a pass flips polarity once.
         self.spi.write(&[BIT_WRITECMD]).await?;
-
         self.cs.set_low().ok();
-        self.shown.copy_from_slice(&self.fb);
         Ok(())
+    }
+
+    /// Drive every changed line with both VCOM polarities in a row: the pixels
+    /// get a complete AC cycle at update time while the visible image never
+    /// changes, and untouched lines are not re-driven at all.
+    async fn refresh(&mut self, full: bool) {
+        // Both passes compare against the same "previous" image, so a line
+        // changes-then-changes-back is still written twice and stays stable.
+        let base = self.shown;
+        let _ = self.write_pass(false, full, &base).await;
+        let _ = self.write_pass(true, full, &base).await;
+        self.shown.copy_from_slice(&self.fb);
     }
 
     // A standalone VCOM ping is deliberately NOT provided. Sending a bare
@@ -219,7 +223,7 @@ where
         self.shown.fill(0xFF);
         for _ in 0..3 {
             self.shown.fill(0xFF);
-            let _ = self.write_frame(true).await;
+            self.refresh(true).await;
             embassy_time::Timer::after_millis(5).await;
         }
         self.shown.copy_from_slice(&self.fb);
@@ -229,7 +233,7 @@ where
         // Only the changed gate lines are rewritten, so an update does not
         // flash the whole panel.
         if self.fb != self.shown {
-            let _ = self.write_frame(false).await;
+            self.refresh(false).await;
         }
     }
 

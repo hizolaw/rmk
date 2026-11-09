@@ -10,7 +10,7 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 #[cfg(feature = "split")]
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use rmk_types::ble::BleState;
 use rmk_types::connection::ConnectionType;
 use rmk_types::led_indicator::LedIndicator;

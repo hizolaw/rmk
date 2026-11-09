@@ -1399,6 +1399,9 @@ pub enum DisplayDriver {
     Sh1107,
     Sh1108,
     Ssd1309,
+    /// Sharp memory LCD (nice!view), single bit per pixel over SPI. `size`
+    /// names the panel, e.g. "160x68".
+    Ls0xx,
 }
 
 /// Display configuration

@@ -314,6 +314,11 @@ trouble-host = { git = "https://github.com/embassy-rs/trouble", rev = "8cca99e5c
     "gatt",
     "derive",
     "security",
+    # Legacy (pre-4.2) pairing in addition to LE Secure Connections. Without
+    # this, trouble-host only speaks LESC, so a Bluetooth 4.0/4.1 host adapter
+    # (e.g. CSR-based dongles, HCI version 6) cannot pair at all even though
+    # the keyboard is discoverable. Newer hosts still negotiate LESC.
+    "legacy-pairing",
     "serde",
     "default-packet-pool",
     "default-packet-pool-size-32",

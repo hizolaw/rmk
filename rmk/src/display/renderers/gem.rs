@@ -43,11 +43,23 @@ const STROKE: PrimitiveStyle<BinaryColor> = PrimitiveStyle::with_stroke(BinaryCo
 const FILL: PrimitiveStyle<BinaryColor> = PrimitiveStyle::with_fill(BinaryColor::On);
 
 /// Number of BLE profiles drawn as dots at the bottom.
-const PROFILES: u8 = 4;
+const PROFILES: u8 = crate::NUM_BLE_PROFILE as u8;
+
+/// WPM samples kept for the history chart. At 3px per bar plus a 2px gap,
+/// 12 bars fit the 68px-wide portrait surface with margins.
+const WPM_HIST: usize = 12;
 
 /// Gem-style status renderer for a portrait memory LCD.
+///
+/// Keeps a short WPM history for the body-band chart. Renders are triggered
+/// by state changes (a WPM update is one), rate-limited by the processor, so
+/// while typing the samples land at roughly the render cadence.
 #[derive(Default)]
-pub struct GemRenderer;
+pub struct GemRenderer {
+    /// Oldest-to-newest WPM samples; the first `wpm_len` entries are valid.
+    wpm_hist: [u8; WPM_HIST],
+    wpm_len: usize,
+}
 
 impl DisplayRenderer<BinaryColor> for GemRenderer {
     fn render<D: DrawTarget<Color = BinaryColor>>(&mut self, ctx: &RenderContext, display: &mut D) {
@@ -59,6 +71,8 @@ impl DisplayRenderer<BinaryColor> for GemRenderer {
         if ctx.sleeping {
             return;
         }
+
+        self.push_wpm(ctx.wpm);
 
         // Bands: header (signal+battery), body (WPM), footer (layer+profiles).
         let header_h = 22;
@@ -84,6 +98,22 @@ impl DisplayRenderer<BinaryColor> for GemRenderer {
 }
 
 impl GemRenderer {
+    /// Record a WPM sample, dropping the oldest once the window is full.
+    /// Unchanged values are not repeated, so the chart reflects typing
+    /// bursts rather than wall-clock time.
+    fn push_wpm(&mut self, wpm: u16) {
+        let wpm = wpm.min(u8::MAX as u16) as u8;
+        if self.wpm_len > 0 && self.wpm_hist[self.wpm_len - 1] == wpm {
+            return;
+        }
+        if self.wpm_len == WPM_HIST {
+            self.wpm_hist.copy_within(1.., 0);
+            self.wpm_len -= 1;
+        }
+        self.wpm_hist[self.wpm_len] = wpm;
+        self.wpm_len += 1;
+    }
+
     /// "SIG" plus connection bars on the left, battery icon + percent on the right.
     fn draw_header<D: DrawTarget<Color = BinaryColor>>(
         &self,
@@ -215,6 +245,29 @@ impl GemRenderer {
         let vx = (w - val.len() as i32 * 5 - 1).max(1);
         Text::new(&val, Point::new(vx, top + 10), FG).draw(display).ok();
 
+        // History chart: one bar per sample, oldest on the left, scaled to
+        // the largest sample in the window.
+        let hist = &self.wpm_hist[..self.wpm_len];
+        let max = hist.iter().copied().max().unwrap_or(0) as i32;
+        if max == 0 {
+            return;
+        }
+        let chart_top = top + 16;
+        let chart_h = 18;
+        let bar_w = 3;
+        let gap = 2;
+        let total = hist.len() as i32 * (bar_w + gap) - gap;
+        let mut x = ((w - total) / 2).max(1);
+        for &v in hist {
+            let bh = v as i32 * chart_h / max;
+            if bh > 0 {
+                Rectangle::new(Point::new(x, chart_top + chart_h - bh), Size::new(bar_w as u32, bh as u32))
+                    .into_styled(FILL)
+                    .draw(display)
+                    .ok();
+            }
+            x += bar_w + gap;
+        }
     }
 
     /// Layer name in a rounded box, with profile dots underneath.

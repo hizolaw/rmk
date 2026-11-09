@@ -1,8 +1,7 @@
 //! [`DisplayDriver`] adapter for Sharp memory LCDs over SPI.
 //!
 //! The nice!view is a 160x68 Sharp LS0xx panel, one bit per pixel. The wire
-//! protocol follows Zephyr's `ls0xx` driver (proven on this exact panel under
-//! ZMK):
+//! protocol follows Zephyr's `ls0xx` driver:
 //!
 //! * every command byte carries the VCOM polarity bit, which flips each time
 //!   (`ls0xx_cmd`: `buf[0] |= vcom_state ? LS0XX_BIT_VCOM : 0`);
@@ -12,12 +11,13 @@
 //!   numbers from 1, dummy byte 27;
 //! * a trailing write byte latches the last line.
 //!
-//! VCOM maintenance: a memory LCD needs its drive polarity toggled at >= 1 Hz
-//! per the datasheet or DC bias slowly damages the panel. That is *all* the
-//! VCOM bit does — it is not part of the pixel data. [`DisplayDriver::tick`]
-//! sends Zephyr's bare maintenance command, `[vcom_bit, 0x00]`, which keeps
-//! the polarity alternating without touching a single gate line. ZMK runs this
-//! at 30 Hz on the nice!view and it is invisible.
+//! VCOM maintenance: the datasheet wants the drive polarity toggled at >= 1 Hz
+//! to prevent DC-bias aging. Every command byte carries the alternating VCOM
+//! bit, so ordinary content updates already toggle it. [`DisplayDriver::tick`]
+//! is a deliberate no-op: periodic VCOM traffic was tried both ways on this
+//! unit — a full-frame double-pass refresh (visible inversion sweep) and
+//! Zephyr's bare 2-byte `[vcom_bit, 0x00]` ping (even more visible) — and the
+//! panel looks best with no periodic traffic at all.
 
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
@@ -229,14 +229,9 @@ where
     }
 
     async fn tick(&mut self) {
-        // VCOM maintenance (see the module docs): Zephyr's bare ping — a mode
-        // byte carrying the alternating VCOM bit, no pixel data. It flips the
-        // panel's drive polarity without rewriting any gate line, so it is
-        // invisible (ZMK sends this at 30 Hz on this panel). Two bytes: the
-        // command and one dummy byte, matching Zephyr's `empty_cmd[2]`.
-        let cmd = self.next_cmd(0);
-        self.cs.set_high().ok();
-        let _ = self.spi.write(&[cmd, 0x00]).await;
-        self.cs.set_low().ok();
+        // Deliberate no-op (see the module docs): periodic VCOM traffic is
+        // visible on this unit. Content updates carry the alternating VCOM
+        // bit often enough while typing; the panel is bistable and holds the
+        // image untouched the rest of the time.
     }
 }

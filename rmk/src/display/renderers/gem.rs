@@ -135,7 +135,7 @@ impl GemRenderer {
         ctx: &RenderContext,
         display: &mut D,
         w: i32,
-        header_h: i32,
+        _header_h: i32,
     ) {
         let (level, charging): (Option<u8>, bool) = {
             #[cfg(feature = "_ble")]

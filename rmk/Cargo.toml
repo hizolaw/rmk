@@ -62,6 +62,12 @@ trouble-host = { version = "0.8", features = [
     "scan",
     "derive",
     "security",
+    # Legacy (pre-4.2) pairing in addition to LE Secure Connections. Without
+    # this, trouble-host only speaks LESC, so a Bluetooth 4.0/4.1 host adapter
+    # (e.g. CSR-based dongles, HCI version 6) cannot pair at all even though the
+    # keyboard is discoverable. Phones and newer adapters still use LESC.
+    # `secure_connections_only` stays false, so legacy is offered, not forced.
+    "legacy-pairing",
     "serde",
     "default-packet-pool-size-32",
 ], optional = true }

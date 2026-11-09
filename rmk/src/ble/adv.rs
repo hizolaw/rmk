@@ -92,16 +92,21 @@ impl Adv<'_> {
         }
     }
 
-    /// A host link can afford a slow interval and gains from 2M; every other
-    /// peer is RMK's own hardware, where reaching it fast matters more.
+    /// Every advertisement in this module is legacy (`set_legacy_adv(true)`),
+    /// and the Bluetooth spec only allows the 1M PHY on the primary channel for
+    /// legacy advertising. Upstream sent host advertisements on 2M with a 200ms
+    /// interval, which some host controllers (and their drivers) refuse to pair
+    /// with — the keyboard shows up but pairing fails, while a phone's more
+    /// tolerant stack still connects. Use 1M everywhere, and a fast interval for
+    /// the host so discovery and reconnection are quick.
     fn params(&self) -> AdvertisementParameters {
-        let (phy, interval) = match self {
-            Self::Host { .. } => (PhyKind::Le2M, Duration::from_millis(200)),
-            _ => (PhyKind::Le1M, Duration::from_millis(50)),
+        let interval = match self {
+            Self::Host { .. } => Duration::from_millis(30),
+            _ => Duration::from_millis(50),
         };
         AdvertisementParameters {
-            primary_phy: phy,
-            secondary_phy: phy,
+            primary_phy: PhyKind::Le1M,
+            secondary_phy: PhyKind::Le1M,
             tx_power: TxPower::Plus8dBm,
             interval_min: interval,
             interval_max: interval,

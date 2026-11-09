@@ -119,7 +119,7 @@ fn expand_spi_init(chip_series: &ChipSeries, spi: &SpiConfig) -> TokenStream {
                 let display_spi = {
                     use ::embassy_nrf::spim::{Frequency, Spim, Config, MODE_0, BitOrder};
                     let mut cfg = Config::default();
-                    cfg.frequency = Frequency::M1;
+                    cfg.frequency = Frequency::K500;
                     cfg.mode = MODE_0;
                     // Sharp LS0xx addresses line numbers LSB-first (Zephyr sets
                     // SPI_TRANSFER_LSB). The driver default is MSB-first, which

@@ -106,7 +106,10 @@ impl Adv<'_> {
     /// the host so discovery and reconnection are quick.
     fn params(&self) -> AdvertisementParameters {
         let interval = match self {
-            Self::Host { .. } | Self::BondedHost { .. } => Duration::from_millis(30),
+            // 100ms instead of 30ms while advertising: discovery is a bit slower
+            // but the radio wakes far less often when idle. Scan/connect timing
+            // tolerates this fine.
+            Self::Host { .. } | Self::BondedHost { .. } => Duration::from_millis(100),
             _ => Duration::from_millis(50),
         };
         // Only the bonded host may connect to a paired profile.
@@ -117,7 +120,7 @@ impl Adv<'_> {
         AdvertisementParameters {
             primary_phy: PhyKind::Le1M,
             secondary_phy: PhyKind::Le1M,
-            tx_power: TxPower::Plus8dBm,
+            tx_power: TxPower::ZerodBm,
             interval_min: interval,
             interval_max: interval,
             filter_policy,

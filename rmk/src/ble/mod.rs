@@ -32,7 +32,7 @@ use crate::ble::sleep::{report_activity, request_sleep};
 use crate::channel::{BLE_REPORT_CHANNEL, LED_SIGNAL};
 use crate::config::{BleBatteryConfig, DeviceConfig, RmkConfig};
 use crate::core_traits::Runnable;
-use crate::event::SubscribableEvent;
+use crate::event::{EventSubscriber, SleepStateEvent, SubscribableEvent};
 use crate::hid::{HidWriterTrait, run_led_reader};
 #[cfg(feature = "split")]
 use crate::split::PeripheralMatrixConfig;
@@ -285,6 +285,16 @@ async fn run_ble_keyboard<
 
     let connection_loop = async {
         loop {
+            // If the keyboard is asleep, don't advertise at all - stay silent
+            // until a key wakes it. This is what turns "connected but idle" into
+            // "radio fully off" after the idle timeout.
+            while crate::state::current_sleep_state() {
+                let mut key = crate::event::KeyboardEvent::subscriber();
+                let mut pointing = crate::event::PointingEvent::subscriber();
+                let _ = select(key.next_message_pure(), pointing.next_message_pure()).await;
+                report_activity();
+            }
+
             // On the dongle slot, advertise directed to the bonded dongle or
             // as a seeking broadcast; on the normal profiles, plain HID.
             #[cfg(feature = "dongle")]
@@ -762,15 +772,17 @@ pub(crate) async fn set_conn_params<
     stack: &Stack<'_, C, P>,
     conn: &GattConnection<'a, 'b, P>,
 ) {
-    let requests = [
+    let awake = [
         // The first request is what Apple devices accept:
         // https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf
         (Duration::from_millis(15), 30, Duration::from_secs(6)),
-        // The second request is for best performance
-        (Duration::from_micros(7500), 60, Duration::from_secs(6)),
+        // The second request trades a little latency for much less radio
+        // wake-up time: a 30ms interval instead of 7.5ms roughly quarters the
+        // number of connection events the radio must service while typing.
+        (Duration::from_millis(30), 60, Duration::from_secs(6)),
     ];
 
-    for (interval, max_latency, supervision_timeout) in requests {
+    for (interval, max_latency, supervision_timeout) in awake {
         // Wait 5 seconds before each request to avoid connection drop
         embassy_time::Timer::after_secs(5).await;
 
@@ -788,9 +800,42 @@ pub(crate) async fn set_conn_params<
         .await;
     }
 
-    // Wait forever. This is because we want the conn params setting can be interrupted when the connection is lost.
-    // So this task shouldn't quit after setting the conn params.
-    core::future::pending::<()>().await;
+    // From here on follow the keyboard's sleep state. The host link is left at
+    // the fast awake parameters while the keyboard is being used, but a host
+    // connection that keeps to a 30ms interval wakes the radio forever, so on
+    // sleep we widen it a lot. max_latency lets the peripheral skip that many
+    // connection events when there is nothing to send.
+    let mut sleep_events = SleepStateEvent::subscriber();
+    let mut sleeping = crate::state::current_sleep_state();
+    let mut applied_sleeping = false;
+
+    loop {
+        if sleeping != applied_sleeping {
+            let params = if sleeping {
+                RequestedConnParams {
+                    min_connection_interval: Duration::from_millis(200),
+                    max_connection_interval: Duration::from_millis(200),
+                    // Keep supervision_timeout > (interval * (latency+1)).
+                    max_latency: 20, // ~4s
+                    supervision_timeout: Duration::from_secs(6),
+                    ..Default::default()
+                }
+            } else {
+                RequestedConnParams {
+                    min_connection_interval: Duration::from_millis(30),
+                    max_connection_interval: Duration::from_millis(30),
+                    max_latency: 60,
+                    supervision_timeout: Duration::from_secs(6),
+                    ..Default::default()
+                }
+            };
+            if update_conn_params(stack, conn.raw(), &params).await {
+                applied_sleeping = sleeping;
+            }
+        }
+
+        sleeping = sleep_events.next_event().await.0;
+    }
 }
 
 /// Serve one host keyboard connection.
@@ -845,6 +890,21 @@ async fn serve_keyboard_connection<
     #[cfg(feature = "split")]
     let battery_task = embassy_futures::join::join(ble_battery_server.run(), ble_peripheral_battery_server.run());
 
+    // Disconnect when the keyboard goes to sleep. A connected host keeps the
+    // radio busy at the connection interval forever; dropping the link lets the
+    // controller idle completely until a key wakes the keyboard, at which point
+    // the central re-advertises and the host reconnects.
+    let sleep_disconnect = async {
+        let mut sleep_events = SleepStateEvent::subscriber();
+        loop {
+            if sleep_events.next_event().await.0 {
+                info!("[ble] sleeping, disconnecting host");
+                disconnect(conn).await;
+                return;
+            }
+        }
+    };
+
     let communication_task = async {
         if let Either3::First(e) = select3(
             gatt_events_task(server, conn),
@@ -895,7 +955,10 @@ async fn serve_keyboard_connection<
     let dongle_event_task = core::future::pending::<()>();
 
     let inner = join4(writer_task, led_task, host_task, dongle_event_task);
-    select(communication_task, inner).await;
+    // Race the live session against sleep: whichever ends first tears the
+    // connection down, then the outer loop re-advertises (or stays silent while
+    // asleep).
+    let _ = select3(communication_task, sleep_disconnect, inner).await;
 }
 
 // Set the connection PHY.

@@ -53,8 +53,11 @@ events = [
     # ble/mod.rs: KeyboardEvent/PointingEvent wake subscribers, created when
     # advertising times out. Without a reserved slot they panic on boards whose
     # permanent subscribers already fill the base count.
-    { name = "keyboard" },
-    { name = "pointing" },
+    { name = "keyboard", count = 2 },
+    { name = "pointing", count = 2 },
+    # ble/mod.rs: SleepStateEvent::subscriber() watches for sleep while a host
+    # connection is being served (one per active host link).
+    { name = "sleep_state" },
 ]
 
 # Rynk sessions subscribe to these topics; USB+BLE boards need two slots.

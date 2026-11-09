@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, quote};
-use rmk_config::DcdcReg0Voltage;
+use rmk_config::{DcdcReg0Voltage, LfclkSource};
 use rmk_config::resolved::Hardware;
 use rmk_config::resolved::hardware::{BoardConfig, ChipModel, ChipSeries, CommunicationConfig};
 use syn::{ItemFn, ItemMod};
@@ -81,6 +81,50 @@ pub(crate) fn chip_init_default(hardware: &Hardware, peripheral_id: Option<usize
             } else {
                 quote! {}
             };
+            // LFCLK source. Internal RC needs periodic recalibration by MPSL
+            // (waking the 64MHz clock), which costs battery; an external
+            // 32.768kHz crystal does not. The embassy-nrf init and MPSL's own
+            // config must agree, so both are derived from the same setting.
+            let lfclk_source = chip_cfg.lfclk_source.unwrap_or(LfclkSource::InternalRc);
+            let (embassy_lfclk, mpsl_lfclk) = match lfclk_source {
+                LfclkSource::InternalRc => (
+                    quote! { config.lfclk_source = ::embassy_nrf::config::LfclkSource::InternalRC; },
+                    quote! {
+                        let lfclk_cfg = ::nrf_sdc::mpsl::raw::mpsl_clock_lfclk_cfg_t {
+                            source: ::nrf_sdc::mpsl::raw::MPSL_CLOCK_LF_SRC_RC as u8,
+                            rc_ctiv: ::nrf_sdc::mpsl::raw::MPSL_RECOMMENDED_RC_CTIV as u8,
+                            rc_temp_ctiv: ::nrf_sdc::mpsl::raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
+                            accuracy_ppm: 500,
+                            skip_wait_lfclk_started: ::nrf_sdc::mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
+                        };
+                    },
+                ),
+                LfclkSource::ExternalXtal => (
+                    quote! { config.lfclk_source = ::embassy_nrf::config::LfclkSource::ExternalXtal; },
+                    quote! {
+                        let lfclk_cfg = ::nrf_sdc::mpsl::raw::mpsl_clock_lfclk_cfg_t {
+                            source: ::nrf_sdc::mpsl::raw::MPSL_CLOCK_LF_SRC_XTAL as u8,
+                            rc_ctiv: 0,
+                            rc_temp_ctiv: 0,
+                            accuracy_ppm: 50,
+                            skip_wait_lfclk_started: ::nrf_sdc::mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
+                        };
+                    },
+                ),
+                LfclkSource::Synthesized => (
+                    quote! { config.lfclk_source = ::embassy_nrf::config::LfclkSource::Synthesized; },
+                    quote! {
+                        let lfclk_cfg = ::nrf_sdc::mpsl::raw::mpsl_clock_lfclk_cfg_t {
+                            source: ::nrf_sdc::mpsl::raw::MPSL_CLOCK_LF_SRC_SYNTH as u8,
+                            rc_ctiv: 0,
+                            rc_temp_ctiv: 0,
+                            accuracy_ppm: 50,
+                            skip_wait_lfclk_started: ::nrf_sdc::mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
+                        };
+                    },
+                ),
+            };
+
             let ble_addr = get_ble_addr(hardware, peripheral_id);
             // Calculate the size of sdc memory pool.
             // Unibody: 4696. Split central: 6080 + (N-1) * 2288 per peripheral.
@@ -120,15 +164,7 @@ pub(crate) fn chip_init_default(hardware: &Hardware, peripheral_id: Option<usize
                 CommunicationConfig::Ble(_) | CommunicationConfig::Both(_, _) => quote! {
                     // Initialize nrf-sdc and ble stack
                     let mpsl_p = ::nrf_sdc::mpsl::Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
-                    let lfclk_cfg = ::nrf_sdc::mpsl::raw::mpsl_clock_lfclk_cfg_t {
-                        source: ::nrf_sdc::mpsl::raw::MPSL_CLOCK_LF_SRC_RC as u8,
-                        rc_ctiv: ::nrf_sdc::mpsl::raw::MPSL_RECOMMENDED_RC_CTIV as u8,
-                        rc_temp_ctiv: ::nrf_sdc::mpsl::raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
-                        // nRF52 LFRC is +/-500 ppm after calibration (PS 5.4.4.4); the 250 ppm
-                        // MPSL default understates it and narrows the receive window on the peer.
-                        accuracy_ppm: 500,
-                        skip_wait_lfclk_started: ::nrf_sdc::mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
-                    };
+                    #mpsl_lfclk
                     static MPSL: ::static_cell::StaticCell<::nrf_sdc::mpsl::MultiprotocolServiceLayer> = ::static_cell::StaticCell::new();
                     static SESSION_MEM: ::static_cell::StaticCell<::nrf_sdc::mpsl::SessionMem<1>> = ::static_cell::StaticCell::new();
                     let mpsl = MPSL.init(::defmt::unwrap!(::nrf_sdc::mpsl::MultiprotocolServiceLayer::with_timeslots(
@@ -152,6 +188,7 @@ pub(crate) fn chip_init_default(hardware: &Hardware, peripheral_id: Option<usize
             quote! {
                 use embassy_nrf::interrupt::InterruptExt;
                 let mut config = ::embassy_nrf::config::Config::default();
+                #embassy_lfclk
                 #dcdc_config
                 let p = ::embassy_nrf::init(config);
                 #ble_init

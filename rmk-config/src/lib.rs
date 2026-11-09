@@ -716,6 +716,20 @@ pub enum DcdcReg0Voltage {
     V1_8,
 }
 
+/// nRF52 low-frequency clock (LFCLK) source.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LfclkSource {
+    /// Internal RC oscillator. MPSL must periodically wake the high-frequency
+    /// clock to recalibrate it, which costs battery.
+    InternalRc,
+    /// External 32.768 kHz crystal. No recalibration needed, the lowest-power
+    /// and most accurate option - use it when the board has the crystal.
+    ExternalXtal,
+    /// LFCLK synthesized from the high-frequency clock.
+    Synthesized,
+}
+
 /// Config for chip-specific settings
 #[derive(Clone, Default, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -726,6 +740,8 @@ pub struct ChipConfig {
     pub dcdc_reg1: Option<bool>,
     /// DCDC regulator 0 voltage (for nrf52840)
     pub dcdc_reg0_voltage: Option<DcdcReg0Voltage>,
+    /// Low-frequency clock source (nrf52). Defaults to the internal RC.
+    pub lfclk_source: Option<LfclkSource>,
 }
 
 /// Config for lights

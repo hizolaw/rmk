@@ -165,6 +165,11 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                         SplitMessage::SleepState(sleeping) => {
                             publish_event(SleepStateEvent::new(sleeping));
                         }
+                        SplitMessage::SoftOff => {
+                            // The central is powering off; go with it. Wakes
+                            // from the local matrix, same as the central does.
+                            crate::boot::power_off();
+                        }
                         // --- dfu_split: firmware update handlers ---
                         #[cfg(feature = "dfu_split")]
                         SplitMessage::FirmwareHashQuery => {

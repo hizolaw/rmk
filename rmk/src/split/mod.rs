@@ -101,6 +101,30 @@ pub(crate) enum SplitMessage {
     /// Peripheral → Central: confirm mark_updated succeeded, about to reset.
     #[cfg(feature = "dfu_split")]
     FirmwareUpdateConfirm,
+
+    /// Central → Peripheral: power off into System OFF now. The central
+    /// delays its own power-off briefly after sending this so the message
+    /// reaches the peripheral first.
+    SoftOff,
+}
+
+/// Central-side broadcast that tells every connected peripheral to power off.
+///
+/// `PubSubChannel` rather than `Signal` because a split can have more than
+/// one peripheral subscribed; `Signal` is single-waiter and panics on a
+/// second. Published by the `SoftOff` keyboard action, drained by
+/// [`driver::PeripheralManager`] into [`SplitMessage::SoftOff`].
+pub(crate) static SOFT_OFF_CHANNEL: embassy_sync::pubsub::PubSubChannel<
+    crate::RawMutex,
+    (),
+    1,
+    { crate::SPLIT_PERIPHERALS_NUM },
+    1,
+> = embassy_sync::pubsub::PubSubChannel::new();
+
+/// Wake every `SOFT_OFF_CHANNEL` subscriber even if no task is parked on it.
+pub(crate) fn notify_soft_off() {
+    SOFT_OFF_CHANNEL.immediate_publisher().publish_immediate(());
 }
 
 // -----------------------------------------------------------------------

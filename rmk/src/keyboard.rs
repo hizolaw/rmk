@@ -1558,6 +1558,15 @@ impl<'a> Keyboard<'a> {
                 // so in a split this fires on the central no matter which half
                 // the key was pressed on.
                 if !event.pressed {
+                    // Tell every peripheral to power off too. The split link
+                    // runs at 15–30 ms connection intervals, so a 200 ms grace
+                    // period delivers the message with room to spare before the
+                    // central goes down and the link dies.
+                    #[cfg(feature = "split")]
+                    {
+                        crate::split::notify_soft_off();
+                        embassy_time::Timer::after_millis(200).await;
+                    }
                     boot::power_off();
                 }
             }

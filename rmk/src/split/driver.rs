@@ -208,6 +208,9 @@ impl<T: SplitReader + SplitWriter> PeripheralManager<T> {
         #[cfg(feature = "display")]
         let mut modifier_sub = crate::event::ModifierEvent::subscriber();
         let mut sleep_sub = crate::event::SleepStateEvent::subscriber();
+        let mut soft_off_sub = super::SOFT_OFF_CHANNEL
+            .subscriber()
+            .expect("soft-off subscribers capped at SPLIT_PERIPHERALS_NUM");
 
         // Send the current state once on startup so the peripheral matches us
         // even when no transition has happened since the central booted.
@@ -248,6 +251,7 @@ impl<T: SplitReader + SplitWriter> PeripheralManager<T> {
                         SplitMessage::ClearPeer
                     },
                     e = sleep_sub.next_event().fuse() => SplitMessage::SleepState(e.0),
+                    _ = soft_off_sub.next_message_pure().fuse() => SplitMessage::SoftOff,
                     with_feature("display"): e = wpm_sub.next_event().fuse() => SplitMessage::Wpm(e.0),
                     with_feature("display"): e = modifier_sub.next_event().fuse() => SplitMessage::Modifier(e.modifier.into_bits()),
                 }

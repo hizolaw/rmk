@@ -1553,6 +1553,14 @@ impl<'a> Keyboard<'a> {
                     boot::reboot_keyboard();
                 }
             }
+            KeyboardAction::SoftOff => {
+                // Power off on release: the whole keymap runs on the central,
+                // so in a split this fires on the central no matter which half
+                // the key was pressed on.
+                if !event.pressed {
+                    boot::power_off();
+                }
+            }
             #[cfg(feature = "storage")]
             KeyboardAction::ClearEeprom => {
                 // When releasing the key, reset the storage — the same operation

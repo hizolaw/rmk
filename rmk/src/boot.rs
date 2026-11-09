@@ -49,3 +49,84 @@ pub(crate) fn reboot_keyboard() {
     #[cfg(feature = "_esp_ble")]
     esp_hal::system::software_reset();
 }
+
+/// GPIO sets used to wake from nRF System OFF: the matrix outputs to drive
+/// active and the matrix inputs to sense. Registered once at startup by the
+/// generated matrix-init code.
+#[cfg(feature = "_nrf_ble")]
+struct SystemOffPins {
+    outputs: heapless::Vec<(u8, u8), 24>,
+    inputs: heapless::Vec<(u8, u8), 24>,
+}
+
+#[cfg(feature = "_nrf_ble")]
+static SYSTEM_OFF_PINS: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::RefCell<Option<SystemOffPins>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(None));
+
+/// Record the (port, pin) pairs a later `soft_off()` must drive and sense.
+/// Called by generated code; see rmk-macro's matrix pin initialization.
+#[cfg(feature = "_nrf_ble")]
+pub fn register_system_off_pins(outputs: &[(u8, u8)], inputs: &[(u8, u8)]) {
+    SYSTEM_OFF_PINS.lock(|c| {
+        let mut pins = SystemOffPins { outputs: heapless::Vec::new(), inputs: heapless::Vec::new() };
+        for &p in outputs {
+            let _ = pins.outputs.push(p);
+        }
+        for &p in inputs {
+            let _ = pins.inputs.push(p);
+        }
+        *c.borrow_mut() = Some(pins);
+    });
+}
+
+/// Enter nRF System OFF: the deepest power state, from which the chip wakes
+/// with a full reset when a sensed matrix input goes active.
+///
+/// In System OFF the GPIO block retains its configuration, so driving every
+/// matrix output active and arming SENSE on every input makes any key press
+/// connect a driven output to a sensed input and assert DETECT. Without the
+/// driven outputs the inputs would just float and no press could ever wake.
+#[cfg(feature = "_nrf_ble")]
+pub fn soft_off() -> ! {
+    use embassy_nrf::pac;
+    use embassy_nrf::pac::gpio::vals::{Dir, Sense};
+
+    SYSTEM_OFF_PINS.lock(|c| {
+        match c.borrow().as_ref() {
+            Some(pins) => {
+                for &(port, pin) in pins.outputs.iter() {
+                    let p = if port == 0 { pac::P0 } else { pac::P1 };
+                    let n = pin as usize;
+                    p.pin_cnf(n).modify(|w| w.set_dir(Dir::Output));
+                    p.out().modify(|w| w.set_pin(n, true));
+                }
+                for &(port, pin) in pins.inputs.iter() {
+                    let p = if port == 0 { pac::P0 } else { pac::P1 };
+                    p.pin_cnf(pin as usize).modify(|w| w.set_sense(Sense::High));
+                }
+            }
+            None => warn!("soft_off: no wake pins registered, only reset will wake the keyboard"),
+        }
+    });
+
+    pac::POWER.systemoff().write(|w| w.set_systemoff(true));
+    // The write is not instantaneous; park until the chip actually powers down.
+    loop {
+        cortex_m::asm::wfe();
+    }
+}
+
+/// Power the keyboard off. On nRF this is System OFF with matrix wake; on
+/// other chips there is no equivalent yet, so fall back to a reboot.
+pub fn power_off() -> ! {
+    #[cfg(feature = "_nrf_ble")]
+    soft_off();
+
+    #[cfg(not(feature = "_nrf_ble"))]
+    reboot_keyboard();
+
+    #[allow(unreachable_code)]
+    loop {}
+}

@@ -72,6 +72,7 @@ pub(crate) fn to_via_keycode(key_action: KeyAction) -> u16 {
             Action::KeyboardControl(c) => match c {
                 KeyboardAction::Bootloader => 0x7c00,
                 KeyboardAction::Reboot => 0x7c01,
+                KeyboardAction::SoftOff => 0x7c02,
                 KeyboardAction::ClearEeprom => 0x7c03,
                 KeyboardAction::ComboOn => 0x7c50,
                 KeyboardAction::ComboOff => 0x7c51,
@@ -231,6 +232,7 @@ pub(crate) fn from_via_keycode(via_keycode: u16) -> KeyAction {
         }
         0x7C00 => KeyAction::Single(Action::KeyboardControl(KeyboardAction::Bootloader)),
         0x7C01 => KeyAction::Single(Action::KeyboardControl(KeyboardAction::Reboot)),
+        0x7C02 => KeyAction::Single(Action::KeyboardControl(KeyboardAction::SoftOff)),
         0x7C03 => KeyAction::Single(Action::KeyboardControl(KeyboardAction::ClearEeprom)),
         0x7C50 => KeyAction::Single(Action::KeyboardControl(KeyboardAction::ComboOn)),
         0x7C51 => KeyAction::Single(Action::KeyboardControl(KeyboardAction::ComboOff)),

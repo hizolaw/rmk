@@ -202,6 +202,25 @@ pub(crate) fn expand_matrix_input_output_pins(
         (row_pins, col_pins)
     };
 
+    // Arm the nRF System OFF wake source: outputs stay driven in System OFF
+    // (the GPIO block keeps its configuration), and a sensed input asserting
+    // DETECT wakes the chip. `soft_off()` in rmk's boot module consumes this.
+    let soft_off_registration = if chip.series == ChipSeries::Nrf52 {
+        let outputs = output_pins.iter().map(|p| {
+            let (port, pin) = parse_nrf_port_pin(p);
+            quote! { (#port, #pin) }
+        });
+        let inputs = input_pins.iter().map(|p| {
+            let (port, pin) = parse_nrf_port_pin(p);
+            quote! { (#port, #pin) }
+        });
+        quote! {
+            ::rmk::boot::register_system_off_pins(&[#(#outputs),*], &[#(#inputs),*]);
+        }
+    } else {
+        quote! {}
+    };
+
     // Get pin types
     let input_pin_type = get_input_pin_type(chip, async_matrix);
     let output_pin_type = get_output_pin_type(chip);
@@ -226,5 +245,14 @@ pub(crate) fn expand_matrix_input_output_pins(
             #pin_initialization
             (input_pins, output_pins)
         };
+        #soft_off_registration
     }
+}
+
+/// Parse an nRF pin name like `P0_19` into (port, pin number).
+fn parse_nrf_port_pin(name: &str) -> (u8, u8) {
+    name.strip_prefix('P')
+        .and_then(|s| s.split_once('_'))
+        .and_then(|(port, pin)| Some((port.parse().ok()?, pin.parse().ok()?)))
+        .unwrap_or_else(|| panic!("keyboard.toml: invalid nRF pin name '{name}', expected e.g. P0_19"))
 }

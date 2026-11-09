@@ -22,4 +22,7 @@ pub enum KeyboardAction {
     ComboOff,
     ComboToggle,
     CapsWordToggle,
+    /// Enter the chip's deepest power state (nRF System OFF). Wake happens
+    /// through GPIO sense and comes back as a full reset.
+    SoftOff,
 }

@@ -492,10 +492,20 @@ where
                     },
                 }
             } else {
-                // While sleeping, ignore timers and wait only for state changes.
+                // While sleeping, ignore the render timers and wait for state
+                // changes; a memory LCD still needs its periodic VCOM tick to
+                // keep the panel biased correctly through the night.
                 let was_sleeping = self.ctx.sleeping;
-                let event = sub.next_event().await;
-                self.process(event).await;
+                match vcom_ticker.as_mut() {
+                    Some(v) => match select(v.next(), sub.next_event()).await {
+                        Either::First(_) => self.display.tick().await,
+                        Either::Second(event) => self.process(event).await,
+                    },
+                    None => {
+                        let event = sub.next_event().await;
+                        self.process(event).await;
+                    }
+                }
 
                 if was_sleeping
                     && !self.ctx.sleeping

@@ -9,10 +9,14 @@
 //!   numbers from 1, dummy byte 27;
 //! * a trailing write byte latches the last line.
 //!
-//! VCOM is carried by the real frame writes. There is intentionally **no**
-//! standalone VCOM ping: a bare VCOM command with no pixel data made the panel
-//! shimmer and fade, because this driver repaints only on state changes rather
-//! than continuously like Zephyr's LVGL loop.
+//! VCOM maintenance: a memory LCD needs its cells driven with alternating
+//! polarity (>= 1 Hz per the datasheet) or DC bias slowly damages the panel.
+//! [`DisplayDriver::tick`] repaints the whole frame twice in a row, once per
+//! polarity. Because the visible image is `wire_data XOR vcom`, inverting the
+//! line data on the VCOM-set pass leaves the picture unchanged while every
+//! pixel sees a complete AC cycle. A *bare* VCOM ping (a mode byte with no
+//! pixel data, which is what Zephyr sends from its LVGL thread) is not used:
+//! without re-driven data it made this panel shimmer and fade.
 
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
@@ -118,7 +122,7 @@ where
     /// given VCOM polarity. The visible image is `data XOR vcom`, so on a
     /// VCOM-set pass the data is inverted as well; that keeps the picture
     /// identical while the pixels receive one AC polarity.
-    async fn write_pass(&mut self, vcom: bool, full: bool, base: &[u8; FB]) -> Result<(), SPI::Error> {
+    async fn write_pass(&mut self, vcom: bool, full: bool) -> Result<(), SPI::Error> {
         let per_line = bytes_per_line::<W>();
         let mut line = [0u8; 1 + 32 + 1];
 
@@ -129,7 +133,7 @@ where
 
         for y in 0..H {
             let src = &self.fb[y * per_line..(y + 1) * per_line];
-            if !full && src == &base[y * per_line..(y + 1) * per_line] {
+            if !full && src == &self.shown[y * per_line..(y + 1) * per_line] {
                 continue;
             }
             for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
@@ -151,20 +155,13 @@ where
     /// get a complete AC cycle at update time while the visible image never
     /// changes, and untouched lines are not re-driven at all.
     async fn refresh(&mut self, full: bool) {
-        // Both passes compare against the same "previous" image, so a line
-        // changes-then-changes-back is still written twice and stays stable.
-        let base = self.shown;
-        let _ = self.write_pass(false, full, &base).await;
-        let _ = self.write_pass(true, full, &base).await;
+        // Both passes compare against `self.shown`, which is only updated
+        // afterwards, so a line that changes-then-changes-back between two
+        // flushes is still written twice and stays stable.
+        let _ = self.write_pass(false, full).await;
+        let _ = self.write_pass(true, full).await;
         self.shown.copy_from_slice(&self.fb);
     }
-
-    // A standalone VCOM ping is deliberately NOT provided. Sending a bare
-    // VCOM command with no pixel data (Zephyr does this from its own thread)
-    // made the nice!view shimmer and fade here: that driver repaints whole
-    // frames continuously through LVGL, while this one only repaints on state
-    // changes. `memory-lcd-spi`, the driver that works with this panel in
-    // Rust, likewise never pings - VCOM is carried by each real frame.
 }
 
 impl<SPI, CS, const W: usize, const H: usize, const FB: usize> OriginDimensions
@@ -238,9 +235,12 @@ where
     }
 
     async fn tick(&mut self) {
-        // Deliberately empty. A Sharp memory LCD is bistable: once written, a
-        // pixel holds its state with no refresh. Periodically re-driving it
-        // only makes the panel flicker, so refresh happens in flush() when the
-        // content actually changes, and never otherwise.
+        // VCOM maintenance (see the module docs): repaint the whole frame with
+        // both polarities back to back. The visible image is `data XOR vcom`,
+        // so the two passes leave the picture untouched while every pixel sees
+        // one full AC cycle. Content changes don't count as maintenance — they
+        // rewrite only the changed lines — so this full double-pass runs on the
+        // processor's vcom interval whether or not anything was drawn.
+        self.refresh(true).await;
     }
 }

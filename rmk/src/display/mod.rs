@@ -65,7 +65,7 @@ use embedded_graphics::prelude::*;
 pub use lcd_async;
 #[cfg(feature = "oled_async")]
 pub use oled_async;
-pub use renderers::{LogoRenderer, OledRenderer};
+pub use renderers::{GemRenderer, LogoRenderer, OledRenderer};
 use rmk_macro::processor;
 #[cfg(feature = "_ble")]
 use rmk_types::ble::BleStatus;

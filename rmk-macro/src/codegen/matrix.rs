@@ -8,7 +8,7 @@ use rmk_config::resolved::hardware::{
 
 use super::chip::gpio::{
     convert_direct_pins_to_initializers, convert_input_pins_to_initializers,
-    convert_output_pins_to_initializers, get_input_pin_type, get_output_pin_type,
+    convert_output_pins_to_initializers, get_input_pin_type, get_output_pin_type, parse_nrf_port_pin,
 };
 use super::feature::is_feature_enabled;
 
@@ -247,12 +247,4 @@ pub(crate) fn expand_matrix_input_output_pins(
         };
         #soft_off_registration
     }
-}
-
-/// Parse an nRF pin name like `P0_19` into (port, pin number).
-fn parse_nrf_port_pin(name: &str) -> (u8, u8) {
-    name.strip_prefix('P')
-        .and_then(|s| s.split_once('_'))
-        .and_then(|(port, pin)| Some((port.parse().ok()?, pin.parse().ok()?)))
-        .unwrap_or_else(|| panic!("keyboard.toml: invalid nRF pin name '{name}', expected e.g. P0_19"))
 }

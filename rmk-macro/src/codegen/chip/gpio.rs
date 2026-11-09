@@ -222,19 +222,44 @@ fn get_pin_num_stm32(gpio_name: &str) -> Option<String> {
     }
 }
 
+/// Parse an nRF pin name like `P0_19` into (port, pin number).
+pub(crate) fn parse_nrf_port_pin(name: &str) -> (u8, u8) {
+    name.strip_prefix('P')
+        .and_then(|s| s.split_once('_'))
+        .and_then(|(port, pin)| Some((port.parse().ok()?, pin.parse().ok()?)))
+        .unwrap_or_else(|| panic!("keyboard.toml: invalid nRF pin name '{name}', expected e.g. P0_19"))
+}
+
 pub fn expand_output_config(hardware: &Hardware) -> TokenStream {
     expand_output_initialization(hardware.output.clone(), &hardware.chip)
 }
 
 pub fn expand_output_initialization(outputs: Vec<OutputConfig>, chip: &ChipModel) -> TokenStream {
-    outputs
-        .into_iter()
+    let mut expanded: TokenStream = outputs
+        .iter()
         .map(|oc| {
             convert_gpio_str_to_persisted_output_pin(
                 chip,
-                oc.pin,
+                oc.pin.clone(),
                 oc.initial_state_active ^ oc.low_active,
             )
         })
-        .collect()
+        .collect();
+
+    // On nRF the GPIO output state is retained through System OFF, so an
+    // output left driven (EXT_POWER feeding the display, say) keeps powering
+    // its rail while the keyboard is off. Register the inactive level of
+    // every declared output so `boot::soft_off()` can drive it.
+    if chip.series == ChipSeries::Nrf52 && !outputs.is_empty() {
+        let entries = outputs.iter().map(|oc| {
+            let (port, pin) = parse_nrf_port_pin(&oc.pin);
+            let off_high = oc.low_active;
+            quote! { (#port, #pin, #off_high) }
+        });
+        expanded.extend(quote! {
+            ::rmk::boot::register_system_off_low_pins(&[#(#entries),*]);
+        });
+    }
+
+    expanded
 }

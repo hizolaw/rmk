@@ -65,6 +65,30 @@ static SYSTEM_OFF_PINS: embassy_sync::blocking_mutex::Mutex<
     core::cell::RefCell<Option<SystemOffPins>>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(None));
 
+/// Output pins to return to their inactive level before System OFF — e.g. the
+/// EXT_POWER rail feeding the display. The GPIO output state survives System
+/// OFF, so a rail left driven keeps powering its peripherals the whole time
+/// the keyboard is "off". The bool is the level to drive, already resolved
+/// from the output's active polarity by the codegen.
+#[cfg(feature = "_nrf_ble")]
+static SYSTEM_OFF_LOW_PINS: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::RefCell<Option<heapless::Vec<(u8, u8, bool), 8>>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(None));
+
+/// Record the (port, pin, level) triples `soft_off()` drives before System
+/// OFF. Called by generated code; see rmk-macro's output pin initialization.
+#[cfg(feature = "_nrf_ble")]
+pub fn register_system_off_low_pins(pins: &[(u8, u8, bool)]) {
+    SYSTEM_OFF_LOW_PINS.lock(|c| {
+        let mut v = heapless::Vec::new();
+        for &p in pins {
+            let _ = v.push(p);
+        }
+        *c.borrow_mut() = Some(v);
+    });
+}
+
 /// Record the (port, pin) pairs a later `soft_off()` must drive and sense.
 /// Called by generated code; see rmk-macro's matrix pin initialization.
 #[cfg(feature = "_nrf_ble")]
@@ -92,6 +116,20 @@ pub fn register_system_off_pins(outputs: &[(u8, u8)], inputs: &[(u8, u8)]) {
 pub fn soft_off() -> ! {
     use embassy_nrf::pac;
     use embassy_nrf::pac::gpio::vals::{Dir, Sense};
+
+    // Drop the power rails first: EXT_POWER feeds the display, and GPIO
+    // output state is retained through System OFF, so without this the panel
+    // stays powered (and DC-biased on a static image) until the next wake.
+    SYSTEM_OFF_LOW_PINS.lock(|c| {
+        if let Some(pins) = c.borrow().as_ref() {
+            for &(port, pin, high) in pins.iter() {
+                let p = if port == 0 { pac::P0 } else { pac::P1 };
+                let n = pin as usize;
+                p.pin_cnf(n).modify(|w| w.set_dir(Dir::Output));
+                p.out().modify(|w| w.set_pin(n, high));
+            }
+        }
+    });
 
     SYSTEM_OFF_PINS.lock(|c| {
         match c.borrow().as_ref() {

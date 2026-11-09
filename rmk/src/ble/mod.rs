@@ -7,7 +7,9 @@ use bt_hci::cmd::le::{
     LeClearAdvSets, LeExtCreateConn, LeReadNumberOfSupportedAdvSets, LeSetAdvSetRandomAddr, LeSetExtAdvData,
     LeSetExtAdvParams, LeSetExtScanParams, LeSetExtScanResponseData,
 };
-use bt_hci::cmd::le::{LeRand, LeReadLocalSupportedFeatures, LeSetPhy};
+use bt_hci::cmd::le::{
+    LeAddDeviceToFilterAcceptList, LeClearFilterAcceptList, LeRand, LeReadLocalSupportedFeatures, LeSetPhy,
+};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use bt_hci::param::Error as HciError;
 #[cfg(feature = "split")]
@@ -116,6 +118,19 @@ pub trait CentralCmds: ControllerCmdSync<LeSetScanParams> {}
 
 #[cfg(not(feature = "ext_adv"))]
 impl<T: ControllerCmdSync<LeSetScanParams>> CentralCmds for T {}
+
+/// HCI commands required to program the controller's filter accept list,
+/// which restricts which peer may connect to an advertisement.
+#[doc(hidden)]
+pub trait FilterCmds:
+    ControllerCmdSync<LeClearFilterAcceptList> + ControllerCmdSync<LeAddDeviceToFilterAcceptList>
+{
+}
+
+impl<T> FilterCmds for T where
+    T: ControllerCmdSync<LeClearFilterAcceptList> + ControllerCmdSync<LeAddDeviceToFilterAcceptList>
+{
+}
 
 /// Max number of connections of a keyboard's BLE stack; a dongle sizes its
 /// own — see [`crate::dongle::Dongle`].
@@ -243,6 +258,7 @@ impl<'a, C> Runnable for BleTransport<'a, C>
 where
     C: Controller
         + ExtAdvCmds
+        + FilterCmds
         + ControllerCmdAsync<LeSetPhy>
         + ControllerCmdSync<LeReadLocalSupportedFeatures>
         + ControllerCmdSync<LeRand>,
@@ -277,12 +293,14 @@ impl<
     #[cfg(not(feature = "subrating"))] C: Controller
         + CentralCmds
         + ExtAdvCmds
+        + FilterCmds
         + ControllerCmdAsync<LeSetPhy>
         + ControllerCmdSync<LeReadLocalSupportedFeatures>
         + ControllerCmdSync<LeRand>,
     #[cfg(feature = "subrating")] C: Controller
         + CentralCmds
         + ExtAdvCmds
+        + FilterCmds
         + ControllerCmdAsync<LeSetPhy>
         + ControllerCmdSync<LeReadLocalSupportedFeatures>
         + ControllerCmdSync<LeRand>
@@ -333,7 +351,7 @@ impl<
 /// serves forever, joined with the stack runner and the sleep manager.
 async fn run_ble_keyboard<
     #[cfg(feature = "host")] 'r,
-    C: Controller + ExtAdvCmds + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
+    C: Controller + ExtAdvCmds + FilterCmds + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
 >(
     stack: &Stack<'_, C, DefaultPacketPool>,
     device_config: &DeviceConfig<'static>,
@@ -391,7 +409,15 @@ async fn run_ble_keyboard<
         let mut adv_deadline: Option<Instant> = None;
         loop {
             // On the dongle slot, advertise directed to the bonded dongle or
-            // as a seeking broadcast; on the normal profiles, plain HID.
+            // as a seeking broadcast. On a paired host profile, advertise only
+            // to the bonded host, so another host in range cannot take the
+            // connection and then fail encryption (issue #1131: the
+            // connect/disconnect loop that spams hosts with pairing prompts).
+            // To re-pair a profile whose bonded host is gone, clear the bond.
+            let host_adv = |profile| match profile_manager.bond_info(profile) {
+                Some(bond) => Adv::BondedHost { name: product_name, addr: bond.info.identity.addr },
+                None => Adv::Host { name: product_name },
+            };
             #[cfg(feature = "dongle")]
             let adv = if crate::state::current_profile() == crate::ble::profile::DONGLE_PROFILE {
                 match profile_manager.bond_info(crate::ble::profile::DONGLE_PROFILE) {
@@ -399,10 +425,10 @@ async fn run_ble_keyboard<
                     None => Adv::DongleSeeking,
                 }
             } else {
-                Adv::Host { name: product_name }
+                host_adv(crate::state::current_profile())
             };
             #[cfg(not(feature = "dongle"))]
-            let adv = Adv::Host { name: product_name };
+            let adv = host_adv(crate::state::current_profile());
 
             // Wait for 10ms to ensure the USB is checked
             Timer::after_millis(10).await;

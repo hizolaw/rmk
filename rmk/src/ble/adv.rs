@@ -6,7 +6,7 @@ use trouble_host::prelude::appearance::human_interface_device::KEYBOARD;
 use trouble_host::prelude::service::{BATTERY, HUMAN_INTERFACE_DEVICE};
 use trouble_host::prelude::*;
 
-use crate::ble::ExtAdvCmds;
+use crate::ble::{ExtAdvCmds, FilterCmds};
 
 /// Company identifier marking an advertisement as RMK's own.
 const RMK_ADV_COMPANY_ID: u16 = 0x5253;
@@ -24,6 +24,11 @@ pub(crate) enum Adv<'a> {
     Directed(Address),
     /// Any BLE host, which finds us as a standard HID keyboard.
     Host { name: &'a str },
+    /// A paired profile's bonded host. Same HID payload as `Host`, but the
+    /// controller only accepts a connection from `addr` (see `params()`), so
+    /// another host in range cannot grab the profile and then fail encryption -
+    /// the connect/disconnect loop behind issue #1131.
+    BondedHost { name: &'a str, addr: Address },
     /// A bonded host reconnecting without HID discovery data.
     HostReconnect,
     /// The split central that owns peripheral `id`.
@@ -37,7 +42,7 @@ impl Adv<'_> {
     fn build<'b>(&self, buf: &'b mut [u8; 31]) -> Result<Advertisement<'b>, Error> {
         let adv_data: &[AdStructure] = match *self {
             Self::Directed(peer) => return Ok(Advertisement::ConnectableNonscannableDirected { peer }),
-            Self::Host { name } => &[
+            Self::Host { name } | Self::BondedHost { name, .. } => &[
                 AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
                 AdStructure::CompleteServiceUuids16(&[BATTERY.to_le_bytes(), HUMAN_INTERFACE_DEVICE.to_le_bytes()]),
                 AdStructure::CompleteLocalName(name.as_bytes()),
@@ -100,8 +105,13 @@ impl Adv<'_> {
     /// All variants use legacy PDUs, which require the 1M primary PHY.
     fn params(&self) -> AdvertisementParameters {
         let interval = match self {
-            Self::Host { .. } => Duration::from_millis(200),
+            Self::Host { .. } | Self::BondedHost { .. } => Duration::from_millis(200),
             _ => Duration::from_millis(50),
+        };
+        // Only the bonded host may connect to a paired profile.
+        let filter_policy = match self {
+            Self::BondedHost { .. } => AdvFilterPolicy::FilterConnAndScan,
+            _ => AdvFilterPolicy::Unfiltered,
         };
         AdvertisementParameters {
             primary_phy: PhyKind::Le1M,
@@ -109,19 +119,37 @@ impl Adv<'_> {
             tx_power: TxPower::Plus8dBm,
             interval_min: interval,
             interval_max: interval,
+            filter_policy,
             ..Default::default()
+        }
+    }
+
+    /// The bonded peer whose address must be in the controller's accept list,
+    /// or `None` when the advertisement stays open to any peer.
+    fn bonded_peer(&self) -> Option<Address> {
+        match self {
+            Self::BondedHost { addr, .. } => Some(*addr),
+            _ => None,
         }
     }
 }
 
 /// Advertise with an optional local address override and accept a connection within `timeout`.
-pub(crate) async fn advertise<'a, 'b, C: Controller + ExtAdvCmds, const ATT: usize, const CONN: usize>(
+pub(crate) async fn advertise<'a, 'b, C: Controller + ExtAdvCmds + FilterCmds, const ATT: usize, const CONN: usize>(
     peripheral: &mut Peripheral<'a, C, DefaultPacketPool>,
     server: &'b AttributeServer<'_, NoopRawMutex, DefaultPacketPool, ATT, CONN>,
     adv: Adv<'_>,
     address: Option<BdAddr>,
     timeout: Duration,
 ) -> Result<GattConnection<'a, 'b, DefaultPacketPool>, BleHostError<C::Error>> {
+    // Restrict connections to the bonded host when there is one. The accept
+    // list must be (re)programmed before each advertisement starts; clearing it
+    // for open advertisements keeps a previous profile's filter from lingering.
+    match adv.bonded_peer() {
+        Some(addr) => peripheral.set_filter_accept_list(&[addr]).await?,
+        None => peripheral.set_filter_accept_list(&[]).await?,
+    }
+
     let mut buf = [0; 31];
     #[cfg(feature = "ext_adv")]
     let advertiser = {
@@ -158,6 +186,7 @@ mod tests {
         assert_eq!(LONGEST_NAME.len(), BLE_ADV_NAME_MAX_LEN);
         for adv in [
             Adv::Host { name: LONGEST_NAME },
+            Adv::BondedHost { name: LONGEST_NAME, addr: Address::random([1, 2, 3, 4, 5, 0xC6]) },
             Adv::HostReconnect,
             Adv::Directed(Address::random([1, 2, 3, 4, 5, 0xC6])),
             Adv::SplitPeripheral { id: 0xFF },
@@ -185,6 +214,19 @@ mod tests {
         };
         assert_eq!(adv_data, [0x02, 0x01, 0x04]);
         assert!(scan_data.is_empty());
+    }
+
+    #[test]
+    fn only_a_bonded_host_advertisement_filters_connections() {
+        use trouble_host::prelude::AdvFilterPolicy;
+        let addr = Address::random([1, 2, 3, 4, 5, 0xC6]);
+        let bonded = Adv::BondedHost { name: "kbd", addr };
+        assert_eq!(bonded.params().filter_policy, AdvFilterPolicy::FilterConnAndScan);
+        assert_eq!(bonded.bonded_peer(), Some(addr));
+        for adv in [Adv::Host { name: "kbd" }, Adv::HostReconnect, Adv::Directed(addr)] {
+            assert_eq!(adv.params().filter_policy, AdvFilterPolicy::Unfiltered);
+            assert_eq!(adv.bonded_peer(), None);
+        }
     }
 
     #[test]

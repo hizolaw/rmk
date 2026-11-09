@@ -1,22 +1,23 @@
 //! [`DisplayDriver`] adapter for Sharp memory LCDs over SPI.
 //!
 //! The nice!view is a 160x68 Sharp LS0xx panel, one bit per pixel. The wire
-//! protocol mirrors the Rust `memory-lcd-spi` driver (the one known to work
-//! with this panel) with Zephyr's command bit values:
+//! protocol follows Zephyr's `ls0xx` driver (proven on this exact panel under
+//! ZMK):
 //!
-//! * every command byte carries the VCOM polarity bit, which flips each time;
+//! * every command byte carries the VCOM polarity bit, which flips each time
+//!   (`ls0xx_cmd`: `buf[0] |= vcom_state ? LS0XX_BIT_VCOM : 0`);
+//! * pixel data is never inverted — "high/1 means white, low/0 means black"
+//!   on the wire, independent of VCOM;
 //! * each gate line is `[line_number, W/8 data bytes, dummy_byte]`, line
 //!   numbers from 1, dummy byte 27;
 //! * a trailing write byte latches the last line.
 //!
-//! VCOM maintenance: a memory LCD needs its cells driven with alternating
-//! polarity (>= 1 Hz per the datasheet) or DC bias slowly damages the panel.
-//! [`DisplayDriver::tick`] repaints the whole frame twice in a row, once per
-//! polarity. Because the visible image is `wire_data XOR vcom`, inverting the
-//! line data on the VCOM-set pass leaves the picture unchanged while every
-//! pixel sees a complete AC cycle. A *bare* VCOM ping (a mode byte with no
-//! pixel data, which is what Zephyr sends from its LVGL thread) is not used:
-//! without re-driven data it made this panel shimmer and fade.
+//! VCOM maintenance: a memory LCD needs its drive polarity toggled at >= 1 Hz
+//! per the datasheet or DC bias slowly damages the panel. That is *all* the
+//! VCOM bit does — it is not part of the pixel data. [`DisplayDriver::tick`]
+//! sends Zephyr's bare maintenance command, `[vcom_bit, 0x00]`, which keeps
+//! the polarity alternating without touching a single gate line. ZMK runs this
+//! at 30 Hz on the nice!view and it is invisible.
 
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
@@ -65,9 +66,8 @@ pub struct Ls0xxDisplay<SPI, CS, const W: usize, const H: usize, const FB: usize
     shown: [u8; FB],
     /// Single VCOM polarity, exactly like Zephyr's `ls0xx_data.vcom_state`:
     /// it flips on *every* command byte sent (clear, frame start, frame end,
-    /// idle ping). Keeping one shared flag is what makes the AC drive correct;
-    /// pixels only latch their new state when consecutive writes see opposite
-    /// polarity, and a separate flag per path broke that parity.
+    /// idle ping), so the panel's drive polarity alternates uniformly no
+    /// matter which path is talking.
     vcom_state: bool,
     /// Display rotation in degrees: 0, 90, 180, 270. The panel is physically
     /// W x H; for 90/270 the logical drawing surface is H x W (portrait).
@@ -117,18 +117,19 @@ where
 
     /// Zephyr `ls0xx_update_display`: start command, one buffer per gate line
     /// `[line, pixels, dummy]`, then a trailing command that latches the last
-    /// line. Commands carry VCOM, the per-line buffers do not.
-    /// Write the gate lines whose content differs from `shown`, using the
-    /// given VCOM polarity. The visible image is `data XOR vcom`, so on a
-    /// VCOM-set pass the data is inverted as well; that keeps the picture
-    /// identical while the pixels receive one AC polarity.
-    async fn write_pass(&mut self, vcom: bool, full: bool) -> Result<(), SPI::Error> {
+    /// line. Commands carry VCOM (via `next_cmd`), the per-line buffers do
+    /// not, and pixel data is written as-is — the VCOM bit is AC drive, not
+    /// part of the image.
+    ///
+    /// With `full` unset, only lines whose content differs from `shown` are
+    /// rewritten, so a content update does not flash the whole panel.
+    async fn write_lines(&mut self, full: bool) -> Result<(), SPI::Error> {
         let per_line = bytes_per_line::<W>();
         let mut line = [0u8; 1 + 32 + 1];
 
         self.cs.set_high().ok();
 
-        let start = if vcom { BIT_WRITECMD | BIT_VCOM } else { BIT_WRITECMD };
+        let start = self.next_cmd(BIT_WRITECMD);
         self.spi.write(&[start]).await?;
 
         for y in 0..H {
@@ -137,29 +138,28 @@ where
                 continue;
             }
             for (dst, &b) in line[1..1 + per_line].iter_mut().zip(src) {
-                // white background / black content = !b; flip again on a
-                // VCOM-set pass so the visible result is unchanged.
-                *dst = if vcom { b } else { !b };
+                // white background / black content = !b. Never inverted for
+                // VCOM; Zephyr sends the same data on every refresh.
+                *dst = !b;
             }
             line[0] = (y + 1) as u8;
             line[1 + per_line] = LINE_DUMMY;
             self.spi.write(&line[..2 + per_line]).await?;
         }
 
-        self.spi.write(&[BIT_WRITECMD]).await?;
+        let end = self.next_cmd(BIT_WRITECMD);
+        self.spi.write(&[end]).await?;
         self.cs.set_low().ok();
         Ok(())
     }
 
-    /// Drive every changed line with both VCOM polarities in a row: the pixels
-    /// get a complete AC cycle at update time while the visible image never
-    /// changes, and untouched lines are not re-driven at all.
+    /// Write the framebuffer to the panel once. Content updates use
+    /// `full = false` to skip unchanged lines.
     async fn refresh(&mut self, full: bool) {
-        // Both passes compare against `self.shown`, which is only updated
-        // afterwards, so a line that changes-then-changes-back between two
-        // flushes is still written twice and stays stable.
-        let _ = self.write_pass(false, full).await;
-        let _ = self.write_pass(true, full).await;
+        // `shown` is only updated afterwards, so a line that
+        // changes-then-changes-back between two flushes is still written and
+        // stays stable.
+        let _ = self.write_lines(full).await;
         self.shown.copy_from_slice(&self.fb);
     }
 }
@@ -217,13 +217,7 @@ where
         embassy_time::Timer::after_millis(10).await;
 
         self.fb.fill(0);
-        self.shown.fill(0xFF);
-        for _ in 0..3 {
-            self.shown.fill(0xFF);
-            self.refresh(true).await;
-            embassy_time::Timer::after_millis(5).await;
-        }
-        self.shown.copy_from_slice(&self.fb);
+        self.refresh(true).await;
     }
 
     async fn flush(&mut self) {
@@ -235,12 +229,14 @@ where
     }
 
     async fn tick(&mut self) {
-        // VCOM maintenance (see the module docs): repaint the whole frame with
-        // both polarities back to back. The visible image is `data XOR vcom`,
-        // so the two passes leave the picture untouched while every pixel sees
-        // one full AC cycle. Content changes don't count as maintenance — they
-        // rewrite only the changed lines — so this full double-pass runs on the
-        // processor's vcom interval whether or not anything was drawn.
-        self.refresh(true).await;
+        // VCOM maintenance (see the module docs): Zephyr's bare ping — a mode
+        // byte carrying the alternating VCOM bit, no pixel data. It flips the
+        // panel's drive polarity without rewriting any gate line, so it is
+        // invisible (ZMK sends this at 30 Hz on this panel). Two bytes: the
+        // command and one dummy byte, matching Zephyr's `empty_cmd[2]`.
+        let cmd = self.next_cmd(0);
+        self.cs.set_high().ok();
+        let _ = self.spi.write(&[cmd, 0x00]).await;
+        self.cs.set_low().ok();
     }
 }

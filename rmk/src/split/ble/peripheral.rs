@@ -9,7 +9,7 @@ use trouble_host::prelude::*;
 use super::PeerAddress;
 use super::{GattSplitMessage, SplitMessage};
 use crate::ble::adv::{Adv, advertise};
-use crate::event::{CentralConnectedEvent, KeyboardEvent, SleepStateEvent, SubscribableEvent, publish_event};
+use crate::event::{CentralConnectedEvent, SleepStateEvent, publish_event};
 use crate::split::driver::{SplitDriverError, SplitReader, SplitWriter};
 use crate::split::peripheral::SplitPeripheral;
 use crate::state::update_status;
@@ -208,13 +208,12 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<
                     info!("Disconnected from the central");
                 }
                 Err(BleHostError::BleHost(Error::Timeout)) => {
-                    // Timeout, wait new keys to continue
-                    error!("Connect to central timeout");
-                    publish_event(SleepStateEvent::new(true));
-                    let mut sub = KeyboardEvent::subscriber();
-                    sub.clear();
-                    let _ = sub.next_message_pure().await;
-                    continue;
+                    // A full directed + seeking advertise cycle (~310s) went
+                    // unanswered: the central is off. Power off too instead of
+                    // burning the battery on advertising; the matrix wake
+                    // brings us back (cold boot) on the next key press.
+                    error!("Connect to central timeout, powering off");
+                    crate::boot::power_off();
                 }
                 Err(e) => {
                     #[cfg(feature = "defmt")]

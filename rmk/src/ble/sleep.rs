@@ -1,18 +1,27 @@
 //! Keyboard-wide sleep management.
 //!
-//! One manager owns the keyboard's sleep state: it watches [`SLEEP_INPUT`],
-//! latches each decision in [`SLEEPING_STATE`] for pollers like the battery
-//! service, and publishes it as [`SleepStateEvent`] for everything else — the
-//! display, and on split centrals the per-link connection-parameter followers
-//! in `split::ble::central`.
+//! One manager owns the keyboard's sleep state: it watches [`SLEEP_INPUT`]
+//! for activity and sleep requests, and once the keyboard has been idle for
+//! the configured timeout it powers the keyboard off — nRF System OFF with
+//! matrix wake, see [`crate::boot::power_off`]. There is no intermediate
+//! low-power state: the keyboard is either awake or off, and the next key
+//! press cold-boots it.
+//!
+//! In test builds the power-off is stubbed out and the manager instead
+//! latches the decision in [`SLEEPING_STATE`] and publishes it as
+//! [`SleepStateEvent`](crate::event::SleepStateEvent), so the state machine
+//! can be observed.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
+#[cfg(test)]
+use core::sync::atomic::Ordering;
 
 use embassy_futures::select::{Either, select};
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 
 use crate::SPLIT_CENTRAL_SLEEP_TIMEOUT_SECONDS;
+#[cfg(test)]
 use crate::event::{SleepStateEvent, publish_event};
 
 /// The latched sleep state.
@@ -71,15 +80,32 @@ async fn manage_sleep_state(idle_timeout: Duration) -> ! {
             }
         }
         info!("Entering sleep mode");
-        SLEEPING_STATE.store(true, Ordering::Release);
-        publish_event(SleepStateEvent::new(true));
 
-        // Asleep: only activity wakes us; further sleep requests change nothing.
-        while SLEEP_INPUT.wait().await {}
+        #[cfg(not(test))]
+        {
+            // Sleep is System OFF: tell the peripherals first and give the
+            // split link a grace period to deliver the message, then power
+            // the central off. Wake is a cold boot from the matrix.
+            #[cfg(feature = "split")]
+            {
+                crate::split::notify_soft_off();
+                Timer::after_millis(200).await;
+            }
+            crate::boot::power_off();
+        }
 
-        info!("Waking up from sleep mode due to activity");
-        SLEEPING_STATE.store(false, Ordering::Release);
-        publish_event(SleepStateEvent::new(false));
+        #[cfg(test)]
+        {
+            SLEEPING_STATE.store(true, Ordering::Release);
+            publish_event(SleepStateEvent::new(true));
+
+            // Asleep: only activity wakes us; further sleep requests change nothing.
+            while SLEEP_INPUT.wait().await {}
+
+            info!("Waking up from sleep mode due to activity");
+            SLEEPING_STATE.store(false, Ordering::Release);
+            publish_event(SleepStateEvent::new(false));
+        }
     }
 }
 

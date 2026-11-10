@@ -777,38 +777,35 @@ pub(crate) async fn set_conn_params<
     stack: &Stack<'_, C, P>,
     conn: &GattConnection<'a, 'b, P>,
 ) {
-    let awake = [
-        // The first request is what Apple devices accept:
-        // https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf
-        (Duration::from_millis(15), 30, Duration::from_secs(6)),
-        // The second request trades a little latency for much less radio
-        // wake-up time: a 30ms interval instead of 7.5ms roughly quarters the
-        // number of connection events the radio must service while typing.
-        (Duration::from_millis(30), 60, Duration::from_secs(6)),
-    ];
-
-    for (interval, max_latency, supervision_timeout) in awake {
-        // Wait 5 seconds before each request to avoid connection drop
-        embassy_time::Timer::after_secs(5).await;
-
-        update_conn_params(
-            stack,
-            conn.raw(),
-            &RequestedConnParams {
-                min_connection_interval: interval,
-                max_connection_interval: interval,
-                max_latency,
-                supervision_timeout,
-                ..Default::default()
-            },
-        )
-        .await;
-    }
+    // Awake parameters: 15ms interval / latency 30 — the same cadence ZMK
+    // requests (min 7.5, max 15, latency 30) and what Apple devices accept:
+    // https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf
+    //
+    // This used to be followed by a 30ms/latency-60 step for power, but there
+    // is no way back from it: sleep is System OFF now, so the sleep-event
+    // follower below never fires, and the permanent +15ms average delay was
+    // perceptible while typing. Slave latency already covers idle power: with
+    // nothing to send the keyboard skips up to 30 events, so the radio only
+    // checks in every ~0.5s even at a 15ms interval.
+    //
+    // Wait 5 seconds before the request to avoid connection drop.
+    embassy_time::Timer::after_secs(5).await;
+    update_conn_params(
+        stack,
+        conn.raw(),
+        &RequestedConnParams {
+            min_connection_interval: Duration::from_millis(15),
+            max_connection_interval: Duration::from_millis(15),
+            max_latency: 30,
+            supervision_timeout: Duration::from_secs(6),
+            ..Default::default()
+        },
+    )
+    .await;
 
     // From here on follow the keyboard's sleep state. The host link is left at
-    // the fast awake parameters while the keyboard is being used, but a host
-    // connection that keeps to a 30ms interval wakes the radio forever, so on
-    // sleep we widen it a lot. max_latency lets the peripheral skip that many
+    // the fast awake parameters while the keyboard is being used; on sleep we
+    // widen it a lot. max_latency lets the peripheral skip that many
     // connection events when there is nothing to send.
     let mut sleep_events = SleepStateEvent::subscriber();
     let mut sleeping = crate::state::current_sleep_state();
@@ -827,9 +824,9 @@ pub(crate) async fn set_conn_params<
                 }
             } else {
                 RequestedConnParams {
-                    min_connection_interval: Duration::from_millis(30),
-                    max_connection_interval: Duration::from_millis(30),
-                    max_latency: 60,
+                    min_connection_interval: Duration::from_millis(15),
+                    max_connection_interval: Duration::from_millis(15),
+                    max_latency: 30,
                     supervision_timeout: Duration::from_secs(6),
                     ..Default::default()
                 }

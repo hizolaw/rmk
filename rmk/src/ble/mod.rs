@@ -12,7 +12,7 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use rmk_types::ble::BleState;
-use rmk_types::connection::ConnectionType;
+use rmk_types::connection::{ConnectionType, UsbState};
 use rmk_types::led_indicator::LedIndicator;
 use trouble_host::prelude::*;
 
@@ -373,10 +373,15 @@ async fn run_ble_keyboard<
                     }
                 }
                 Either::First(Err(BleHostError::BleHost(Error::Timeout))) => {
-                    warn!("Advertising timeout, sleep and wait for any key");
                     set_ble_state(BleState::Inactive);
 
-                    request_sleep();
+                    // Sleep is System OFF, so only enter it on battery. With USB
+                    // attached there is nothing to save and wake would be a cold
+                    // boot, so the keyboard just waits for a key and re-advertises.
+                    if crate::state::current_usb_state() == UsbState::Disabled {
+                        warn!("Advertising timeout, sleep and wait for any key");
+                        request_sleep();
+                    }
 
                     // Wake on key or pointing activity after the advertising
                     // timeout. Subscribed here, not up front: a permanently
@@ -607,16 +612,16 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
 
                         if control_point_write {
                             info!("Write GATT Event to Control Point: {:?}", event.handle());
-                            // Forward an HID Control Point write to sleep management.
                             // HID Class spec opcodes for the HID Control Point characteristic:
                             //   - 0: HID_CTRL_SUSPEND
                             //   - 1: HID_CTRL_EXIT_SUSPEND
-                            if data_len == 1 {
-                                match data[0] {
-                                    0 => request_sleep(),
-                                    1 => report_activity(),
-                                    _ => {}
-                                }
+                            // SUSPEND is ignored on purpose: hosts emit it liberally
+                            // (screen off, USB power saving) and sleep is System OFF,
+                            // so acting on it would power the keyboard off mid-session.
+                            // A real host sleep drops the link; the advertising
+                            // timeout path is what takes the keyboard down.
+                            if data_len == 1 && data[0] == 1 {
+                                report_activity();
                             }
                         }
 
